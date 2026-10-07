@@ -667,7 +667,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.7.1";
+const APP_VERSION = "4.7.3";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -988,6 +988,7 @@ function renderLockStage(stage){
       const key = setPasswordAndKey(p1, null);
       unlockApp();
       document.getElementById('lockScreen').style.display = 'none';
+      document.getElementById('lockStage').innerHTML = '';
       toast('Password updated');
       route();
       setTimeout(()=>showRecoveryKeyModal(key, 'Password reset. Your previous recovery key no longer works — this is the new one.'), 300);
@@ -1008,6 +1009,7 @@ function renderLockStage(stage){
       if(verifyPassword(pw)){
         unlockApp();
         document.getElementById('lockScreen').style.display = 'none';
+        document.getElementById('lockStage').innerHTML = '';   /* no password field left on the page, so Chrome stops offering to save "passwords" while searching */
         route();
         upgradeSecurityAfterLogin(pw);
       } else {
@@ -1224,13 +1226,14 @@ function auditAdd(rows){
   Store.set('audit', list);
 }
 function itemsSig(items){ return (items||[]).map(i=>`${i.modelNumber||i.productName}×${Number(i.qty)||0}`).join('|'); }
-function entryDesc(e){ return `Memo ${e.memo||'?'} · ${e.salesman||'?'} · ৳${numPlain(e.total)}`; }
+const curTag = ()=>getSettings().currency || '৳';
+function entryDesc(e){ return `Memo ${e.memo||'?'} · ${e.salesman||'?'} · ${curTag()} ${numPlain(e.total)}`; }
 function entryDiffText(o, n){
   const bits = [];
   if(o.memo!==n.memo) bits.push(`memo ${o.memo}→${n.memo}`);
   if(o.date!==n.date) bits.push(`date ${o.date}→${n.date}`);
   if(o.salesman!==n.salesman) bits.push(`salesman ${o.salesman}→${n.salesman}`);
-  if((Number(o.total)||0)!==(Number(n.total)||0)) bits.push(`total ৳${numPlain(o.total)}→৳${numPlain(n.total)}`);
+  if((Number(o.total)||0)!==(Number(n.total)||0)) bits.push(`total ${curTag()} ${numPlain(o.total)}→${curTag()} ${numPlain(n.total)}`);
   if((o.contractor||'')!==(n.contractor||'')) bits.push(`contractor ${o.contractor||'—'}→${n.contractor||'—'}`);
   if(itemsSig(o.items)!==itemsSig(n.items)) bits.push('products changed');
   return bits.join('; ') || 'updated';
@@ -1315,10 +1318,20 @@ function productFor(products, it){
   if(!p && it.productName) p = products.find(x=>x.productName===it.productName);
   return p || null;
 }
+const normName = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
+/* Stock only moves when the memo line points at exactly one product: the exact model, or a product name that has just one model.
+   A name that exists under several models (and no model typed) is ambiguous, so no model's stock is touched. */
+function productForStock(prods, it){
+  const model = String(it.modelNumber||'').trim();
+  if(model){ const p = prods.find(x=>x.modelNumber===model); if(p) return p; }
+  const nm = normName(it.productName);
+  if(nm){ const ps = prods.filter(x=>normName(x.productName)===nm); if(ps.length===1) return ps[0]; }
+  return null;
+}
 function accStock(prods, items, sign, map){
   (items||[]).forEach(it=>{
     const q = Number(it.qty)||0; if(!q) return;
-    const p = productFor(prods, it); if(!p) return;
+    const p = productForStock(prods, it); if(!p) return;
     map.set(p.id, (map.get(p.id)||0) + sign*q);
   });
 }
@@ -2301,6 +2314,40 @@ function renderTargetPanel(bizKey){
 function renderSalesView(bizKey){ location.hash = 'sales/'+bizKey; }
 
 /* ---------------- Accounts list (one card per salesman, per business) ---------------- */
+/* v4.7.3 — list-level Filter (Promotional Sales + Sales Target, every business).
+   One in-memory filter per business per mode. It uses exactly the same rules as
+   the Filter inside a salesman's account (filterAcctSales), applied to every
+   salesman's memos in turn — so the top cards, every salesman card and the
+   All Accounts Summary all change together, automatically. */
+const listFilterState = {};
+function blankLF(){ return {search:'', dateFrom:'', dateTo:'', memoFrom:'', memoTo:'', product:'', totalMin:'', totalMax:'', promoMin:'', promoMax:'', status:'', filterOpen:false}; }
+function getLF(bizKey, mode){ const k = mode+'||'+bizKey; if(!listFilterState[k]) listFilterState[k] = blankLF(); return listFilterState[k]; }
+function lfLabel(f){
+  const bits = [];
+  if(f.dateFrom || f.dateTo) bits.push('Date '+(f.dateFrom?fmtDateNice(f.dateFrom):'…')+' – '+(f.dateTo?fmtDateNice(f.dateTo):'…'));
+  if(f.memoFrom || f.memoTo) bits.push('Memo '+(f.memoFrom||'…')+' – '+(f.memoTo||'…'));
+  if(f.product) bits.push('Product: '+f.product);
+  if(f.status) bits.push(f.status==='dup' ? 'Duplicate only' : 'OK only');
+  if(f.totalMin!=='' || f.totalMax!=='') bits.push('Total '+(f.totalMin!==''?f.totalMin:'0')+' – '+(f.totalMax!==''?f.totalMax:'∞'));
+  if(f.promoMin!=='' || f.promoMax!=='') bits.push('Promo '+(f.promoMin!==''?f.promoMin:'0')+' – '+(f.promoMax!==''?f.promoMax:'∞'));
+  return bits.join(' • ');
+}
+/* One salesman's memos in the given mode, narrowed by a list filter (or untouched when none is active). */
+function acctFilteredEntries(bizKey, name, mode, f){
+  const base = acctBaseEntries(bizKey, name, mode);
+  if(!f || !isFilterActive(f)) return base;
+  return filterAcctSales(base, f, bizKey, computeDuplicateKeys(base));
+}
+/* Per-salesman stats for the list page. Unfiltered = the normal figures.
+   Filtered = recomputed from only the matching memos (pace / incentive are
+   projections of the whole period, so they are left out of a filtered view). */
+function listStats(bizKey, mode, f){
+  if(!f || !isFilterActive(f)) return allAccountStats(bizKey);
+  return getSalesmen(bizKey).map(name=>{
+    const st = filteredAcctStats(bizKey, name, acctFilteredEntries(bizKey, name, mode, f));
+    return Object.assign({name}, st, {incentive:null});
+  });
+}
 function renderSalesAccountsList(bizKey, mode){
   mode = mode || 'promo';
   if(!bizKey || !BUSINESSES.find(b=>b.key===bizKey)){ location.hash = 'dashboard'; return; }
@@ -2308,29 +2355,37 @@ function renderSalesAccountsList(bizKey, mode){
   const routePrefix = isTarget ? 'target' : 'sales';
   setTitle((isTarget ? 'Sales Target — ' : 'Promotional Sales — ')+bizName(bizKey));
   const salesmen = getSalesmen(bizKey);
-  const stats = allAccountStats(bizKey);
-  const totals = stats.reduce((a,s)=>({periodTotal:a.periodTotal+s.periodTotal, periodPromo:a.periodPromo+s.periodPromo, total:a.total+s.total, promo:a.promo+s.promo, target:a.target+s.target}), {periodTotal:0, periodPromo:0, total:0, promo:0, target:0});
-  const overallPct = totals.target ? Math.round(totals.periodTotal/totals.target*100) : 0;
-  const overallPromoPct = totals.target ? Math.round(totals.periodPromo/totals.target*100) : 0;
-  const maxPromoTotal = Math.max(0, ...stats.map(s=>s.total));
-
-  const topCardsHtml = isTarget ? `
-      <div class="stat-card"><span class="eyebrow">Combined Target</span><div class="stat-value">${fmtMoney(totals.target)}</div><div class="stat-label">All accounts, ${bizName(bizKey)}</div></div>
-      <div class="stat-card"><span class="eyebrow">Combined Sales Target Achieve</span><div class="stat-value">${fmtMoney(totals.periodTotal)}</div><div class="stat-label">${overallPct}% of target, ${esc(targetPeriodLabel(bizKey))}</div></div>
-      <div class="stat-card"><span class="eyebrow">Combined Promotional Sales Target Achieve</span><div class="stat-value">${fmtMoney(totals.periodPromo)}</div><div class="stat-label">${overallPromoPct}% of target</div></div>
-      <div class="stat-card"><span class="eyebrow">Accounts</span><div class="stat-value">${salesmen.length}</div><div class="stat-label">Salesman accounts</div></div>
-  ` : `
-      <div class="stat-card"><span class="eyebrow">Combined Total Sales</span><div class="stat-value">${fmtMoney(totals.total)}</div><div class="stat-label">All accounts, all time</div></div>
-      <div class="stat-card"><span class="eyebrow">Combined Promotional Sales</span><div class="stat-value">${fmtMoney(totals.promo)}</div><div class="stat-label">Auto-calculated from products sold</div></div>
-      <div class="stat-card"><span class="eyebrow">Memos</span><div class="stat-value">${stats.reduce((a,s)=>a+s.count,0)}</div><div class="stat-label">Sales entries recorded</div></div>
-      <div class="stat-card"><span class="eyebrow">Accounts</span><div class="stat-value">${salesmen.length}</div><div class="stat-label">Salesman accounts</div></div>
-  `;
+  const lf = getLF(bizKey, mode);
 
   const view = document.getElementById('view');
   view.innerHTML = `
-    <div class="grid grid-4" style="margin-bottom:18px;">
-      ${topCardsHtml}
+    <div class="toolbar" style="margin-bottom:12px;">
+      <button class="btn" id="btnListFilter" type="button">▾ Filter</button>
+      <span id="listFilterBadge" style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;"></span>
+      <span class="spacer"></span>
     </div>
+
+    <div class="filter-panel ${lf.filterOpen?'open':''}" id="listFilterPanel">
+      <div class="filter-grid">
+        <div><label>Date from</label><input type="date" id="lfDateFrom" value="${lf.dateFrom||''}"/></div>
+        <div><label>Date to</label><input type="date" id="lfDateTo" value="${lf.dateTo||''}"/></div>
+        <div><label>Memo from</label><input type="text" id="lfMemoFrom" autocomplete="off" value="${esc(lf.memoFrom)}"/></div>
+        <div><label>Memo to</label><input type="text" id="lfMemoTo" autocomplete="off" value="${esc(lf.memoTo)}"/></div>
+        <div><label>Product contains</label><input type="text" id="lfProduct" autocomplete="off" value="${esc(lf.product)}"/></div>
+        <div><label>Status</label><select id="lfStatus"><option value="">All</option><option value="ok" ${lf.status==='ok'?'selected':''}>OK only</option><option value="dup" ${lf.status==='dup'?'selected':''}>Duplicate only</option></select></div>
+        <div><label>Min total amount</label><input type="number" id="lfTotalMin" value="${lf.totalMin}"/></div>
+        <div><label>Max total amount</label><input type="number" id="lfTotalMax" value="${lf.totalMax}"/></div>
+        <div><label>Min promo amount</label><input type="number" id="lfPromoMin" value="${lf.promoMin}"/></div>
+        <div><label>Max promo amount</label><input type="number" id="lfPromoMax" value="${lf.promoMax}"/></div>
+      </div>
+      <p class="hint" style="margin:8px 0 0;">Applies to every salesman account in ${esc(bizName(bizKey))} at once. Every field you fill is applied together, and the cards below, each salesman's card and the All Accounts Summary update automatically.</p>
+      <div style="margin-top:12px; display:flex; gap:8px;">
+        <button class="btn btn-primary btn-sm" id="btnListApply" type="button">Apply Filter</button>
+        <button class="btn btn-ghost btn-sm" id="btnListReset" type="button">Reset</button>
+      </div>
+    </div>
+
+    <div class="grid grid-4" id="listTopCards" style="margin-bottom:18px;"></div>
 
     ${isTarget ? `<div class="card" style="margin-bottom:16px;">${renderTargetPanel(bizKey)}</div>` : ''}
 
@@ -2342,10 +2397,42 @@ function renderSalesAccountsList(bizKey, mode){
       ${isTarget ? '<button class="btn" id="btnWaBulk" type="button">📲 WhatsApp Reminders</button>' : ''}
     </div>
 
-    <div class="grid grid-4" id="acctGrid">
-      ${salesmen.length===0
-        ? `<div style="grid-column:1/-1;">${emptyState('👤', 'No salesman accounts yet', 'Add salesman names under Accounts, then come back here to open their ledger.')}</div>`
-        : (isTarget ? stats : stats.slice().sort((a,b)=>b.total-a.total)).map((s,idx)=>`
+    <div class="grid grid-4" id="acctGrid"></div>
+  `;
+
+  /* Repaints the filter badge, the four top cards and every salesman card from the current filter. */
+  function paintList(){
+    const active = isFilterActive(lf);
+    const stats = listStats(bizKey, mode, active ? lf : null);
+    const totals = stats.reduce((a,s)=>({periodTotal:a.periodTotal+s.periodTotal, periodPromo:a.periodPromo+s.periodPromo, total:a.total+s.total, promo:a.promo+s.promo, target:a.target+s.target}), {periodTotal:0, periodPromo:0, total:0, promo:0, target:0});
+    const overallPct = totals.target ? Math.round(totals.periodTotal/totals.target*100) : 0;
+    const overallPromoPct = totals.target ? Math.round(totals.periodPromo/totals.target*100) : 0;
+    const maxPromoTotal = Math.max(0, ...stats.map(s=>s.total));
+    const memoCount = stats.reduce((a,s)=>a+(isTarget ? s.periodCount : s.count), 0);
+
+    document.getElementById('btnListFilter').textContent = active ? '▾ Filter (on)' : '▾ Filter';
+    document.getElementById('listFilterBadge').innerHTML = active
+      ? `<span class="badge-count">Filtered</span><span class="text-soft" style="font-size:12.5px;">${esc(lfLabel(lf))}</span><button class="btn btn-ghost btn-sm" id="btnListClear" type="button">✕ Clear filter</button>`
+      : `<span class="text-soft" style="font-size:12.5px;">Filter every salesman account at once — the cards below update automatically.</span>`;
+    const clr = document.getElementById('btnListClear');
+    if(clr) clr.onclick = ()=>{ Object.assign(lf, blankLF(), {filterOpen:lf.filterOpen}); renderSalesAccountsList(bizKey, mode); };
+
+    document.getElementById('listTopCards').innerHTML = isTarget ? `
+      <div class="stat-card"><span class="eyebrow">Combined Target</span><div class="stat-value">${fmtMoney(totals.target)}</div><div class="stat-label">All accounts, ${bizName(bizKey)}</div></div>
+      <div class="stat-card"><span class="eyebrow">Combined Sales Target Achieve${active?' (Filtered)':''}</span><div class="stat-value">${fmtMoney(totals.periodTotal)}</div><div class="stat-label">${overallPct}% of target, ${active ? memoCount+' memo(s) match filter' : esc(targetPeriodLabel(bizKey))}</div></div>
+      <div class="stat-card"><span class="eyebrow">Combined Promotional Sales Target Achieve${active?' (Filtered)':''}</span><div class="stat-value">${fmtMoney(totals.periodPromo)}</div><div class="stat-label">${overallPromoPct}% of target</div></div>
+      <div class="stat-card"><span class="eyebrow">Accounts</span><div class="stat-value">${salesmen.length}</div><div class="stat-label">Salesman accounts</div></div>
+    ` : `
+      <div class="stat-card"><span class="eyebrow">Combined Total Sales${active?' (Filtered)':''}</span><div class="stat-value">${fmtMoney(totals.total)}</div><div class="stat-label">${active ? 'All accounts, matching filter' : 'All accounts, all time'}</div></div>
+      <div class="stat-card"><span class="eyebrow">Combined Promotional Sales${active?' (Filtered)':''}</span><div class="stat-value">${fmtMoney(totals.promo)}</div><div class="stat-label">Auto-calculated from products sold</div></div>
+      <div class="stat-card"><span class="eyebrow">Memos</span><div class="stat-value">${memoCount}</div><div class="stat-label">${active ? 'Sales entries matching filter' : 'Sales entries recorded'}</div></div>
+      <div class="stat-card"><span class="eyebrow">Accounts</span><div class="stat-value">${salesmen.length}</div><div class="stat-label">Salesman accounts</div></div>
+    `;
+
+    const grid = document.getElementById('acctGrid');
+    grid.innerHTML = salesmen.length===0
+      ? `<div style="grid-column:1/-1;">${emptyState('👤', 'No salesman accounts yet', 'Add salesman names under Accounts, then come back here to open their ledger.')}</div>`
+      : (isTarget ? stats : stats.slice().sort((a,b)=>b.total-a.total)).map((s,idx)=>`
         <button class="biz-card ${isTarget?'':'promo-acct-card'}" data-open="${acctSlug(s.name)}" type="button">
           ${isTarget ? `
           <div class="biz-name">${esc(s.name)}</div>
@@ -2354,7 +2441,7 @@ function renderSalesAccountsList(bizKey, mode){
             <div>
               <div class="biz-meta">${fmtMoney(s.periodTotal)} / ${fmtMoney(s.target)}</div>
               <div class="biz-meta">${s.periodCount} memo(s) • Promo Target Achieve ${fmtMoney(s.periodPromo)}</div>
-              ${paceLineHtml(bizKey, s)}${incLineHtml(s)}
+              ${active ? '' : paceLineHtml(bizKey, s)+incLineHtml(s)}
             </div>
           </div>` : `
           <div class="promo-acct-top">
@@ -2373,14 +2460,34 @@ function renderSalesAccountsList(bizKey, mode){
             <span class="btn btn-sm btn-ghost" data-open2="${acctSlug(s.name)}">Open Account</span>
             ${isTarget ? `<span class="btn btn-sm btn-ghost" data-target="${acctSlug(s.name)}">Set Target</span>` : ''}
           </div>
-        </button>`).join('')}
-    </div>
-  `;
-  view.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click', ()=>{ location.hash = routePrefix+'/'+bizKey+'/'+el.dataset.open; }));
-  view.querySelectorAll('[data-open2]').forEach(el=>el.addEventListener('click', (ev)=>{ ev.stopPropagation(); location.hash = routePrefix+'/'+bizKey+'/'+el.dataset.open2; }));
-  view.querySelectorAll('[data-target]').forEach(el=>el.addEventListener('click', (ev)=>{ ev.stopPropagation(); openTargetModal(bizKey, acctUnslug(el.dataset.target), ()=>renderSalesAccountsList(bizKey, mode)); }));
+        </button>`).join('');
+    grid.querySelectorAll('[data-open]').forEach(el=>el.addEventListener('click', ()=>{ location.hash = routePrefix+'/'+bizKey+'/'+el.dataset.open; }));
+    grid.querySelectorAll('[data-open2]').forEach(el=>el.addEventListener('click', (ev)=>{ ev.stopPropagation(); location.hash = routePrefix+'/'+bizKey+'/'+el.dataset.open2; }));
+    grid.querySelectorAll('[data-target]').forEach(el=>el.addEventListener('click', (ev)=>{ ev.stopPropagation(); openTargetModal(bizKey, acctUnslug(el.dataset.target), ()=>renderSalesAccountsList(bizKey, mode)); }));
+  }
+
+  function readLF(){
+    const g = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+    lf.dateFrom = g('lfDateFrom'); lf.dateTo = g('lfDateTo');
+    lf.memoFrom = g('lfMemoFrom'); lf.memoTo = g('lfMemoTo');
+    lf.product = g('lfProduct'); lf.status = g('lfStatus');
+    lf.totalMin = g('lfTotalMin'); lf.totalMax = g('lfTotalMax');
+    lf.promoMin = g('lfPromoMin'); lf.promoMax = g('lfPromoMax');
+  }
+  paintList();
+
+  document.getElementById('btnListFilter').onclick = ()=>{ lf.filterOpen = !lf.filterOpen; document.getElementById('listFilterPanel').classList.toggle('open', lf.filterOpen); };
+  document.getElementById('btnListApply').onclick = ()=>{ readLF(); lf.filterOpen = true; paintList(); };
+  document.getElementById('btnListReset').onclick = ()=>{ Object.assign(lf, blankLF(), {filterOpen:true}); renderSalesAccountsList(bizKey, mode); };
+  /* "Automatic": any change in the filter fields repaints the cards straight away (no need to press Apply). */
+  const autoApplyList = debounce(()=>{ readLF(); paintList(); }, 150);
+  document.querySelectorAll('#listFilterPanel input, #listFilterPanel select').forEach(el=>{
+    el.addEventListener('input', autoApplyList);
+    el.addEventListener('change', autoApplyList);
+  });
+
   document.getElementById('btnManageAccounts').onclick = ()=>{ accountsViewBiz = bizKey; location.hash = 'accounts'; };
-  document.getElementById('btnFullSummary').onclick = ()=>openAllAccountsSummary(bizKey, mode);
+  document.getElementById('btnFullSummary').onclick = ()=>{ readLF(); openAllAccountsSummary(bizKey, mode, isFilterActive(lf) ? Object.assign({}, lf) : null); };
   const waBulkBtn = document.getElementById('btnWaBulk'); if(waBulkBtn) waBulkBtn.onclick = ()=>openWhatsAppBulk(bizKey);
 }
 
@@ -2474,20 +2581,29 @@ function renderSalesAccountView(bizKey, name, mode){
   if(!bizKey || !BUSINESSES.find(b=>b.key===bizKey) || !name){ location.hash = routePrefix+'/'+(bizKey||''); return; }
   setTitle((isTarget ? 'Sales Target — ' : 'Promotional Sales — ')+bizName(bizKey)+' — '+name);
   const avs = getAVS(bizKey, name);
-  const stats = salesmanStats(bizKey, name);
   const showCt = bizHasCtPromo(bizKey);
 
-  const topCardsHtml = isTarget ? `
+  /* v4.7.3 — the four top cards follow the account's Filter. With no filter
+     they show the normal figures; with a filter (or a search) they are
+     recomputed from just the memos that match, the same memos the table and
+     the Summary button use. Pace / incentive are whole-period projections, so
+     they are left out of a filtered view. */
+  function topCardsFor(){
+    const active = isFilterActive(avs);
+    const stats = active ? Object.assign(filteredAcctStats(bizKey, name, currentFiltered()), {incentive:null}) : salesmanStats(bizKey, name);
+    const ftag = active ? ' (Filtered)' : '';
+    return isTarget ? `
       <div class="stat-card"><span class="eyebrow">Salesman</span><div class="stat-value" style="font-size:20px;">${esc(name)}</div><div class="stat-label">${bizName(bizKey)}</div></div>
       <div class="stat-card"><span class="eyebrow">Sales Target</span><div class="stat-value">${fmtMoney(stats.target)}</div><div class="stat-label"><a href="#" id="btnEditTarget" style="color:#8FE3D8;">Edit target</a></div></div>
-      <div class="stat-card"><span class="eyebrow">Sales Target Achieve</span><div class="stat-value">${fmtMoney(stats.periodTotal)}</div><div class="stat-label">${stats.pct}% of target${stats.pct>100?` (${stats.pct-100}% over) 🎉`:''} • ${esc(targetPeriodLabel(bizKey))}</div>${paceStatLabelHtml(bizKey, stats)}${stats.incentive?`<div class="stat-label">🏅 Incentive: ${esc(incText(stats.incentive))}</div>`:''}</div>
-      <div class="stat-card"><span class="eyebrow">Promotional Sales Target Achieve</span><div class="stat-value">${fmtMoney(stats.periodPromo)}</div><div class="stat-label">${stats.promoPct}% of target • ${stats.periodCount} memo(s) in period</div></div>
-  ` : `
+      <div class="stat-card"><span class="eyebrow">Sales Target Achieve${ftag}</span><div class="stat-value">${fmtMoney(stats.periodTotal)}</div><div class="stat-label">${stats.pct}% of target${stats.pct>100?` (${stats.pct-100}% over) 🎉`:''} • ${active ? stats.periodCount+' memo(s) match filter' : esc(targetPeriodLabel(bizKey))}</div>${active ? '' : paceStatLabelHtml(bizKey, stats)}${stats.incentive?`<div class="stat-label">🏅 Incentive: ${esc(incText(stats.incentive))}</div>`:''}</div>
+      <div class="stat-card"><span class="eyebrow">Promotional Sales Target Achieve${ftag}</span><div class="stat-value">${fmtMoney(stats.periodPromo)}</div><div class="stat-label">${stats.promoPct}% of target • ${stats.periodCount} memo(s) ${active ? 'match filter' : 'in period'}</div></div>
+    ` : `
       <div class="stat-card"><span class="eyebrow">Salesman</span><div class="stat-value" style="font-size:20px;">${esc(name)}</div><div class="stat-label">${bizName(bizKey)}</div></div>
-      <div class="stat-card"><span class="eyebrow">Total Sales (All Time)</span><div class="stat-value">${fmtMoney(stats.total)}</div><div class="stat-label">${stats.count} memo(s)</div></div>
-      <div class="stat-card"><span class="eyebrow">Promotional Sales (All Time)</span><div class="stat-value">${fmtMoney(stats.promo)}</div><div class="stat-label">Auto-calculated from products sold</div></div>
-      <div class="stat-card"><span class="eyebrow">Memos</span><div class="stat-value">${stats.count}</div><div class="stat-label">Sales entries recorded</div></div>
-  `;
+      <div class="stat-card"><span class="eyebrow">Total Sales (${active ? 'Filtered' : 'All Time'})</span><div class="stat-value">${fmtMoney(stats.total)}</div><div class="stat-label">${stats.count} memo(s)${active ? ' match filter' : ''}</div></div>
+      <div class="stat-card"><span class="eyebrow">Promotional Sales (${active ? 'Filtered' : 'All Time'})</span><div class="stat-value">${fmtMoney(stats.promo)}</div><div class="stat-label">Auto-calculated from products sold</div></div>
+      <div class="stat-card"><span class="eyebrow">Memos</span><div class="stat-value">${stats.count}</div><div class="stat-label">${active ? 'Sales entries matching filter' : 'Sales entries recorded'}</div></div>
+    `;
+  }
 
   const view = document.getElementById('view');
   view.innerHTML = `
@@ -2496,9 +2612,7 @@ function renderSalesAccountView(bizKey, name, mode){
       <span class="spacer"></span>
     </div>
 
-    <div class="grid grid-4" style="margin-bottom:18px;">
-      ${topCardsHtml}
-    </div>
+    <div class="grid grid-4" id="acctTopCards" style="margin-bottom:18px;"></div>
 
     <div class="toolbar">
       <button class="btn btn-primary" id="btnAdd" type="button">+ Add Entry <span class="kbd">Ctrl+Enter</span></button>
@@ -2508,7 +2622,7 @@ function renderSalesAccountView(bizKey, name, mode){
       <button class="btn" id="btnAcctSummary" type="button">Summary</button>
       <button class="btn" id="btnTransfer" type="button">⇄ Transfer Entries</button>
       ${isTarget ? '<button class="btn" id="btnWa" type="button">📲 WhatsApp</button>' : ''}
-      <div class="search-box"><span class="ic">🔎</span><input id="searchInput" placeholder="Search memo, product…" value="${esc(avs.search)}"/></div>
+      <div class="search-box"><span class="ic">🔎</span><input id="searchInput" type="text" name="pmx_search" autocomplete="off" spellcheck="false" placeholder="Search memo, product…" value="${esc(avs.search)}"/></div>
       <button class="btn" id="btnFilter" type="button">▾ Filter</button>
       <span class="spacer"></span>
       <button class="btn btn-danger" id="btnClear" type="button">Clear Account Data</button>
@@ -2565,7 +2679,15 @@ function renderSalesAccountView(bizKey, name, mode){
     const dupIds = computeDuplicateKeys(base);
     return sortEntries(filterAcctSales(base, avs, bizKey, dupIds), avs.sortBy||'date', avs.sortDir||'asc', bizKey, dupIds);
   }
+  function paintTopCards(){
+    const box = document.getElementById('acctTopCards');
+    if(!box) return;
+    box.innerHTML = topCardsFor();
+    const eb = document.getElementById('btnEditTarget');
+    if(eb) eb.onclick = (ev)=>{ ev.preventDefault(); openTargetModal(bizKey, name, ()=>renderSalesAccountView(bizKey, name, mode)); };
+  }
   function refreshTable(){
+    paintTopCards();   /* cards always match the table below, whatever changed it (filter, search, delete…) */
     const acctEntries = baseAcctEntries();
     const dupIds = computeDuplicateKeys(acctEntries);
     /* SL always reflects the memo's true position in this account's full
@@ -2646,8 +2768,6 @@ function renderSalesAccountView(bizKey, name, mode){
   refreshTable();
 
   document.getElementById('btnBackAccts').onclick = ()=>{ location.hash = routePrefix+'/'+bizKey; };
-  const editTargetBtn = document.getElementById('btnEditTarget');
-  if(editTargetBtn) editTargetBtn.onclick = (ev)=>{ ev.preventDefault(); openTargetModal(bizKey, name, ()=>renderSalesAccountView(bizKey, name, mode)); };
   document.getElementById('btnAdd').onclick = ()=>openSalesEntryModal(bizKey, null, name, mode);
   function syncFiltersFromPanel(){
     /* If the filter panel is open (or fields exist), pull latest values so
@@ -2697,6 +2817,13 @@ function renderSalesAccountView(bizKey, name, mode){
     avs.filterOpen = true;
     refreshTable();
   };
+  /* "Automatic": any change in a filter field updates the table, the four top cards and
+     (when opened) the Summary straight away — no need to press Apply. */
+  const autoApplyAcct = debounce(()=>{ readFilterFields(); refreshTable(); }, 150);
+  document.querySelectorAll('#filterPanel input, #filterPanel select').forEach(el=>{
+    el.addEventListener('input', autoApplyAcct);
+    el.addEventListener('change', autoApplyAcct);
+  });
   document.getElementById('btnSaveFilter').onclick = ()=>{
     readFilterFields();
     saveAVSFilter(bizKey, name, avs);
@@ -3137,7 +3264,7 @@ function accountSummaryHtml(bizKey, name, mode, hideName, entriesOverride){
   ` : `
     <div class="grid grid-3" style="margin-bottom:14px;">
       ${nameField}
-      <div><div class="eyebrow">Total Sales (All Time)</div><div style="font-family:var(--font-display); font-size:18px; color:var(--heading);">${fmtMoney(stats.total)}</div></div>
+      <div><div class="eyebrow">Total Sales (${entriesOverride ? 'Filtered' : 'All Time'})</div><div style="font-family:var(--font-display); font-size:18px; color:var(--heading);">${fmtMoney(stats.total)}</div></div>
       <div><div class="eyebrow">Total Promotional Sales</div><div style="font-family:var(--font-display); font-size:18px; color:var(--accent-dark);">${fmtMoney(stats.promo)}</div></div>
     </div>
   `;
@@ -3191,42 +3318,53 @@ function openIndividualSummary(bizKey, presetName, mode, entriesOverride){
 /* All Accounts Summary — every salesman's individual summary combined into
    one view, ranked with the highest seller first (Sales Target Achieve in
    target mode, Total Sales in promo mode). */
-function rankedSalesmen(bizKey, mode){
+function rankedSalesmen(bizKey, mode, f){
   const key = mode==='target' ? 'periodTotal' : 'total';
+  if(f && isFilterActive(f)){
+    /* a list filter is on: rank by the figures of just the matching memos */
+    const val = {};
+    getSalesmen(bizKey).forEach(n=>{ val[n] = filteredAcctStats(bizKey, n, acctFilteredEntries(bizKey, n, mode, f))[key]; });
+    return getSalesmen(bizKey).slice().sort((a,b)=>val[b]-val[a]);
+  }
   return getSalesmen(bizKey).slice().sort((a,b)=>salesmanStats(bizKey,b)[key]-salesmanStats(bizKey,a)[key]);
 }
-function openAllAccountsSummary(bizKey, mode){
+function openAllAccountsSummary(bizKey, mode, f){
   mode = mode || 'promo';
-  const salesmen = rankedSalesmen(bizKey, mode);
+  const fActive = !!(f && isFilterActive(f));
+  const salesmen = rankedSalesmen(bizKey, mode, f);
+  const ovr = name => fActive ? acctFilteredEntries(bizKey, name, mode, f) : undefined;
+  const filterNote = fActive ? `<div class="badge-count" style="margin-bottom:12px; display:inline-block;">Filter: ${esc(lfLabel(f))}</div>` : '';
   const bodyHtml = salesmen.length===0
     ? `<div class="empty-state">No salesman accounts yet for ${esc(bizName(bizKey))}.</div>`
-    : salesmen.map((name,i)=>`
+    : filterNote + salesmen.map((name,i)=>`
         <div class="${i>0?'all-acct-block':''}">
           <div class="all-acct-name">#${i+1} — ${esc(name)}</div>
-          ${accountSummaryHtml(bizKey, name, mode, true)}
+          ${accountSummaryHtml(bizKey, name, mode, true, ovr(name))}
         </div>`).join('');
   openModal({
-    title:(mode==='target'?'All Accounts Summary — Sales Target — ':'All Accounts Summary — Promotional Sales — ')+bizName(bizKey), wide:true, bodyHtml,
+    title:(mode==='target'?'All Accounts Summary — Sales Target — ':'All Accounts Summary — Promotional Sales — ')+bizName(bizKey)+(fActive?' (Filtered)':''), wide:true, bodyHtml,
     footerHtml:`<button class="btn btn-primary" id="btnPrintAllAcct" type="button" ${salesmen.length?'':'disabled'}>🖨 Print PDF</button><button class="btn btn-ghost" data-cancel type="button">Close</button>`,
     onMount(api){
       api.overlay.querySelector('[data-cancel]').onclick = api.close;
       const printBtn = document.getElementById('btnPrintAllAcct');
-      if(printBtn) printBtn.onclick = ()=>printAllAccountsSummary(bizKey, mode);
+      if(printBtn) printBtn.onclick = ()=>printAllAccountsSummary(bizKey, mode, f);
       enableEnterNav(api.overlay, api.close);
     }
   });
 }
 /* Combined PDF: every account's summary in one business, stacked. */
-function printAllAccountsSummary(bizKey, mode){
+function printAllAccountsSummary(bizKey, mode, f){
   mode = mode || 'promo';
-  const salesmen = rankedSalesmen(bizKey, mode);
+  const fActive = !!(f && isFilterActive(f));
+  const salesmen = rankedSalesmen(bizKey, mode, f);
+  const ovr = name => fActive ? acctFilteredEntries(bizKey, name, mode, f) : undefined;
   /* Each account gets its own page when printed — one account's summary never
      shares a printed page with another account's. */
   const previewHtml = salesmen.length===0
     ? `<div class="empty-state">No salesman accounts yet for ${esc(bizName(bizKey))}.</div>`
-    : salesmen.map((name,i)=>`<div class="all-acct-page${i>0?' all-acct-page-break':''}"><div class="all-acct-name">#${i+1} — ${esc(name)}</div>${accountSummaryHtml(bizKey, name, mode, true)}</div>`).join('');
+    : salesmen.map((name,i)=>`<div class="all-acct-page${i>0?' all-acct-page-break':''}"><div class="all-acct-name">#${i+1} — ${esc(name)}</div>${accountSummaryHtml(bizKey, name, mode, true, ovr(name))}</div>`).join('');
   const label = mode==='target' ? 'All Accounts Summary — Sales Target — ' : 'All Accounts Summary — Promotional Sales — ';
-  openPrintPreview(label+bizName(bizKey), previewHtml, bizName(bizKey)+'_all_accounts_summary_'+mode);
+  openPrintPreview(label+bizName(bizKey)+(fActive?' (Filtered: '+lfLabel(f)+')':''), previewHtml, bizName(bizKey)+'_all_accounts_summary_'+mode);
 }
 
 function printSalesTable(bizKey, rows, salesmanLabel){
@@ -3298,7 +3436,7 @@ function renderProductsView(bizKey){
       <button class="btn" id="btnExcel" type="button">⇩ Convert Excel</button>
       <button class="btn" id="btnSaveAll" type="button">💾 Save</button>
       <button class="btn btn-danger" id="btnDeleteSel" type="button">Delete Selected</button>
-      <div class="search-box"><span class="ic">🔎</span><input id="searchInput" placeholder="Search product or model…" value="${esc(pvs.search)}"/></div>
+      <div class="search-box"><span class="ic">🔎</span><input id="searchInput" type="text" name="pmx_search" autocomplete="off" spellcheck="false" placeholder="Search product or model…" value="${esc(pvs.search)}"/></div>
       <button class="btn" id="btnFilter" type="button">▾ Filter</button>
       <button class="btn btn-accent" id="btnTransfer" type="button">⇄ Data Transfer</button>
       <span class="spacer"></span>
@@ -4507,7 +4645,7 @@ function renderSettings(){
       <div class="section-head"><h2>🔒 Security</h2></div>
       <p class="text-soft" style="font-size:13px; margin-bottom:10px;">PROMAXIS asks for a password every time it's opened in a new browser tab. The password and recovery key are stored only as one-way hashes. ${getAuth() ? 'Status: <b style="color:var(--accent-dark);">password protected ✔</b>' : '<b style="color:var(--coral);">Still on the built-in starter password — please change it now.</b>'}</p>
       <div class="field-row">
-        <div class="field"><label>Current Password</label><input type="password" id="secCurPass" autocomplete="current-password"/></div>
+        <div class="field"><label>Current Password</label><input type="password" id="secCurPass" autocomplete="off"/></div>
         <div class="field"><label>New Password</label><input type="password" id="secNewPass" autocomplete="new-password"/></div>
         <div class="field"><label>Confirm New Password</label><input type="password" id="secNewPass2" autocomplete="new-password"/></div>
       </div>
@@ -5347,29 +5485,64 @@ function rankSalesmen(keys, scope, df, dt){
   });
   return rows.sort((a,b)=>b.value-a.value);
 }
-/* Every product that sold (best first) and, separately, every product in Product Details that did not sell.
-   Total amount = quantity sold × the product's price in Product Details. */
-function rankProducts(keys, df, dt, sortBy){
-  const map = new Map(), soldIds = new Set();
+/* Product-wise sales are built from what was typed on the memos — nothing is guessed.
+   A memo line that has only a product name stays under that name (no model is picked for it).
+   Amount = the memo's total; when a memo has several products the total is shared between them
+   by list value (quantity × price) or, when prices are not set, by quantity. */
+function itemListValue(prods, it){
+  const q = Number(it.qty)||0; if(!q) return 0;
+  const model = String(it.modelNumber||'').trim(), nm = normName(it.productName);
+  let price = 0;
+  if(model){ const p = prods.find(x=>x.modelNumber===model); if(p) price = Number(p.price)||0; }
+  if(!price && nm){ const ps = prods.filter(x=>normName(x.productName)===nm && Number(x.price)>0); if(ps.length) price = ps.reduce((a,x)=>a+Number(x.price),0)/ps.length; }
+  return q*price;
+}
+function memoLineAmounts(prods, e){
+  const lines = (e.items||[]).filter(it=>(Number(it.qty)||0)>0);
+  if(!lines.length) return [];
+  const total = Number(e.total)||0;
+  if(lines.length===1) return [{it:lines[0], amount:total}];
+  let w = lines.map(it=>itemListValue(prods, it)), sw = w.reduce((a,x)=>a+x, 0);
+  if(sw<=0){ w = lines.map(it=>Number(it.qty)||0); sw = w.reduce((a,x)=>a+x, 0); }
+  return lines.map((it,i)=>({it, amount: sw>0 ? total*w[i]/sw : 0}));
+}
+function rankProducts(keys, df, dt, sortBy, group){
+  const byModel = group==='model';
+  const map = new Map(), soldNames = new Set(), soldNoModel = new Set(), soldModels = new Set();
   keys.forEach(bk=>{
-    const prods = getProducts(bk);
+    const prods = getProducts(bk), master = new Map();
+    prods.forEach(p=>{ const k = normName(p.productName); if(k && !master.has(k)) master.set(k, String(p.productName).trim()); });
     getSales(bk).forEach(e=>{
       if(!inRangeE(e, df, dt)) return;
-      (e.items||[]).forEach(it=>{
-        const q = Number(it.qty)||0; if(!q) return;
-        const p = productFor(prods, it);
-        const k = bk+'|'+(p ? p.id : (it.modelNumber||it.productName));
-        const r = map.get(k) || {biz:bk, name:(p?p.productName:it.productName)||it.modelNumber||'(unnamed)', model:p?p.modelNumber:(it.modelNumber||''), qty:0, amount:0, price:p?(Number(p.price)||0):0, inMaster:!!p};
-        r.qty += q; r.amount += r.price*q;
-        map.set(k, r);
-        if(p) soldIds.add(bk+'|'+p.id);
+      memoLineAmounts(prods, e).forEach(({it, amount})=>{
+        const nm = normName(it.productName) || normName(it.modelNumber) || '(UNNAMED)', model = String(it.modelNumber||'').trim();
+        const k = bk+'|'+nm+(byModel ? '|'+model : '');
+        let r = map.get(k);
+        if(!r){ r = {biz:bk, name:master.get(nm) || String(it.productName||it.modelNumber||'(unnamed)').trim(), model:byModel?model:'', qty:0, amount:0, memos:0, ids:new Set()}; map.set(k, r); }
+        r.qty += Number(it.qty)||0; r.amount += amount;
+        if(!r.ids.has(e.id)){ r.ids.add(e.id); r.memos++; }
+        soldNames.add(bk+'|'+nm);
+        if(model) soldModels.add(bk+'|'+model); else soldNoModel.add(bk+'|'+nm);
       });
     });
   });
-  const sold = Array.from(map.values()).sort(sortBy==='qty' ? (a,b)=>b.qty-a.qty || b.amount-a.amount : (a,b)=>b.amount-a.amount || b.qty-a.qty);
+  const sold = Array.from(map.values()).map(r=>{ delete r.ids; return r; })
+    .sort(sortBy==='qty' ? (a,b)=>b.qty-a.qty || b.amount-a.amount : (a,b)=>b.amount-a.amount || b.qty-a.qty);
   const unsold = [];
-  keys.forEach(bk=>getProducts(bk).forEach(p=>{ if(!soldIds.has(bk+'|'+p.id)) unsold.push({biz:bk, name:p.productName||'', model:p.modelNumber||'', stock:Number(p.quantity)||0, price:Number(p.price)||0}); }));
-  unsold.sort((a,b)=>a.name.localeCompare(b.name));
+  keys.forEach(bk=>{
+    if(!byModel){
+      const g = new Map();
+      getProducts(bk).forEach(p=>{ const nm = normName(p.productName); const x = g.get(nm) || (g.set(nm, {biz:bk, name:String(p.productName||'').trim(), models:0, stock:0}), g.get(nm)); x.models++; x.stock += Number(p.quantity)||0; });
+      g.forEach((x,nm)=>{ if(!soldNames.has(bk+'|'+nm)) unsold.push(x); });
+    } else {
+      getProducts(bk).forEach(p=>{
+        const nm = normName(p.productName);
+        if(soldModels.has(bk+'|'+p.modelNumber) || soldNoModel.has(bk+'|'+nm)) return;
+        unsold.push({biz:bk, name:String(p.productName||'').trim(), model:p.modelNumber||'', stock:Number(p.quantity)||0, price:Number(p.price)||0});
+      });
+    }
+  });
+  unsold.sort((a,b)=>a.name.localeCompare(b.name) || String(a.model||'').localeCompare(String(b.model||'')));
   return {sold, unsold};
 }
 function paceStatus(pc, pct){
@@ -5394,7 +5567,7 @@ function paceCardHtml(bk){
     </div>
   </div>`;
 }
-let anState = {biz:'all', scope:'period', from:'', to:'', sort:'amount'};
+let anState = {biz:'all', scope:'period', from:'', to:'', sort:'amount', group:'name'};
 function anKeys(){ return anState.biz==='all' ? BUSINESSES.map(b=>b.key) : [anState.biz]; }
 function anRangeLabel(){ return (anState.from||anState.to) ? `${anState.from?fmtDateNice(anState.from):'start'} – ${anState.to?fmtDateNice(anState.to):'today'}` : 'All dates'; }
 function paceRows(keys){
@@ -5410,7 +5583,8 @@ function renderAnalytics(){
   const keys = anKeys(), df = anState.from, dt = anState.to, multi = anState.biz==='all';
   const trend = monthlyTrend(keys, 12, df, dt);
   const rank = rankSalesmen(keys, anState.scope, df, dt).slice(0, 15);
-  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort);
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group);
+  const byModel = anState.group==='model';
   const paceCards = keys.map(paceCardHtml).join('');
   const sumTotal = trend.reduce((a,t)=>a+t.total,0), sumPromo = trend.reduce((a,t)=>a+t.promo,0);
   const topAmt = Math.max(1, ...sold.map(r=>anState.sort==='qty' ? r.qty : r.amount));
@@ -5451,23 +5625,27 @@ function renderAnalytics(){
     <div class="card" style="margin-bottom:18px;">
       <div class="section-head"><h2>📦 Product-wise sales</h2>
         <span><button class="btn btn-sm ${anState.sort==='amount'?'btn-primary':'btn-ghost'}" data-an-sort="amount" type="button">By amount</button> <button class="btn btn-sm ${anState.sort==='qty'?'btn-primary':'btn-ghost'}" data-an-sort="qty" type="button">By quantity</button> <button class="btn btn-sm btn-primary" id="btnPrintSold" type="button">🖨 Print / PDF</button></span></div>
-      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${sold.length} product(s) sold · ${totQty.toLocaleString()} pcs · <b>${fmtMoney(totAmt)}</b> total. Highest first. Total amount = quantity sold × price in Product Details.</p>
-      ${sold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th><th>Model No.</th>${multi?'<th>Business</th>':''}<th class="right">Qty sold</th><th class="right">Price</th><th class="right">Total amount</th><th style="min-width:120px;"></th></tr></thead><tbody>
-        ${sold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}${r.inMaster?'':' <span class="pill pill-warn" title="Not found in Product Details, so its amount cannot be calculated">not in list</span>'}</td><td class="mono">${esc(r.model)}</td>${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.qty.toLocaleString()}</td><td class="right mono">${r.inMaster?fmtMoney(r.price):'—'}</td><td class="right mono"><b>${fmtMoney(r.amount)}</b></td>
+      <div style="margin:0 0 8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;"><span class="text-soft" style="font-size:12.5px;">Group:</span>
+        <button class="btn btn-sm ${!byModel?'btn-primary':'btn-ghost'}" data-an-group="name" type="button">By product name</button>
+        <button class="btn btn-sm ${byModel?'btn-primary':'btn-ghost'}" data-an-group="model" type="button">By name + model</button></div>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${sold.length} product(s) sold · ${totQty.toLocaleString()} pcs · <b>${fmtMoney(totAmt)}</b> total. Highest first. Products are listed exactly as typed on the memos${byModel?'':' (models are not separated)'}. Total amount = the memo total; when a memo has several products its total is shared between them (by value, or by quantity if prices are not set).</p>
+      ${sold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th>${byModel?'<th>Model No.</th>':''}${multi?'<th>Business</th>':''}<th class="right">Memos</th><th class="right">Qty sold</th><th class="right">Total amount</th><th style="min-width:120px;"></th></tr></thead><tbody>
+        ${sold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td>${byModel?`<td class="mono">${esc(r.model||'—')}</td>`:''}${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.memos}</td><td class="right mono">${r.qty.toLocaleString()}</td><td class="right mono"><b>${fmtMoney(r.amount)}</b></td>
           <td><div class="hbar-track"><div class="hbar-fill" style="width:${Math.max(1.5,(anState.sort==='qty'?r.qty:r.amount)/topAmt*100).toFixed(1)}%"></div></div></td></tr>`).join('')}
-        <tr style="font-weight:700; background:var(--paper);"><td></td><td>Total</td><td></td>${multi?'<td></td>':''}<td class="right mono">${totQty.toLocaleString()}</td><td></td><td class="right mono">${fmtMoney(totAmt)}</td><td></td></tr>
+        <tr style="font-weight:700; background:var(--paper);"><td></td><td>Total</td>${byModel?'<td></td>':''}${multi?'<td></td>':''}<td class="right mono">${sold.reduce((a,r)=>a+r.memos,0)}</td><td class="right mono">${totQty.toLocaleString()}</td><td class="right mono">${fmtMoney(totAmt)}</td><td></td></tr>
         </tbody></table></div>` : emptyState('📦','No product sales in this range','Quantities sold appear here once memos include products.')}
     </div>
 
     <div class="card">
-      <div class="section-head"><h2>🕸️ Products not sold</h2><span><span class="badge-count">${unsold.length} product(s)</span> <button class="btn btn-sm btn-primary" id="btnPrintUnsold" type="button">🖨 Print / PDF</button></span></div>
-      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">In Product Details but with no sales ${(df||dt)?'in this date range':'yet'}.</p>
-      ${unsold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th><th>Model No.</th>${multi?'<th>Business</th>':''}<th class="right">In stock</th><th class="right">Price</th></tr></thead><tbody>
-        ${unsold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td><td class="mono">${esc(r.model)}</td>${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.stock}</td><td class="right mono">${fmtMoney(r.price)}</td></tr>`).join('')}
-        </tbody></table></div>` : emptyState('✅','Every product has sold','All products in Product Details have at least one sale.')}
+      <div class="section-head"><h2>🕸️ Products not sold</h2><span><span class="badge-count">${unsold.length} ${byModel?'product(s)':'product name(s)'}</span> <button class="btn btn-sm btn-primary" id="btnPrintUnsold" type="button">🖨 Print / PDF</button></span></div>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${byModel?'Models in Product Details that no memo has sold':'Product names in Product Details that no memo has sold'} ${(df||dt)?'in this date range':'yet'}.${byModel?' A memo that names a product without a model counts as a sale of every model of that name.':''}</p>
+      ${unsold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th>${byModel?'<th>Model No.</th>':''}${multi?'<th>Business</th>':''}${byModel?'<th class="right">In stock</th><th class="right">Price</th>':'<th class="right">Models in list</th><th class="right">In stock</th>'}</tr></thead><tbody>
+        ${unsold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td>${byModel?`<td class="mono">${esc(r.model||'—')}</td>`:''}${multi?`<td>${esc(bizName(r.biz))}</td>`:''}${byModel?`<td class="right mono">${r.stock}</td><td class="right mono">${fmtMoney(r.price)}</td>`:`<td class="right mono">${r.models}</td><td class="right mono">${r.stock}</td>`}</tr>`).join('')}
+        </tbody></table></div>` : emptyState('✅','Everything has sold','All products in Product Details have at least one sale.')}
     </div>`;
   view.querySelectorAll('[data-an-biz]').forEach(el=>el.onclick = ()=>{ anState.biz = el.dataset.anBiz; renderAnalytics(); });
   view.querySelectorAll('[data-an-scope]').forEach(el=>el.onclick = ()=>{ anState.scope = el.dataset.anScope; renderAnalytics(); });
+  view.querySelectorAll('[data-an-group]').forEach(el=>el.onclick = ()=>{ anState.group = el.dataset.anGroup; renderAnalytics(); });
   view.querySelectorAll('[data-an-sort]').forEach(el=>el.onclick = ()=>{ anState.sort = el.dataset.anSort; renderAnalytics(); });
   document.getElementById('anFrom').onchange = e=>{ anState.from = e.target.value; renderAnalytics(); };
   document.getElementById('anTo').onchange = e=>{ anState.to = e.target.value; renderAnalytics(); };
@@ -5484,16 +5662,18 @@ function analyticsTables(){
     r.pc.state==='running' ? fmtMoney(r.pc.projected)+' ('+r.pc.projPct+'%)' : paceLabel(r.pc), r.pc.left!=null ? r.pc.left : '', r.pc.state==='running' && r.pc.left>0 ? fmtMoney(r.pc.perDay) : '']);
   const trend = monthlyTrend(keys, 12, df, dt);
   const rank = rankSalesmen(keys, anState.scope, df, dt);
-  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort);
-  return {keys, multi, trend, rank, sold, unsold, pace,
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group), byModel = anState.group==='model';
+  const totQty = sold.reduce((a,r)=>a+r.qty,0), totAmt = sold.reduce((a,r)=>a+r.amount,0), totMemos = sold.reduce((a,r)=>a+r.memos,0);
+  return {keys, multi, byModel, trend, rank, sold, unsold, pace, totQty, totAmt,
     paceHead:['Business','Target period','Achieved','Target','Achieve %','Projected at period end','Days left','Needed per day'],
     trendHead:['Month','Total sales','Promotional sales','Memos'], trendRows:trend.map(t=>[t.label, fmtMoney(t.total), fmtMoney(t.promo), t.count]),
     rankHead:['#','Salesman'].concat(multi?['Business']:[]).concat(['Amount'], anState.scope==='period'?['Achieve %']:[]),
     rankRows:rank.map((r,i)=>[i+1, r.name].concat(multi?[bizName(r.biz)]:[]).concat([fmtMoney(r.value)], anState.scope==='period'?[r.pct+'%']:[])),
-    soldHead:['#','Product','Model No.'].concat(multi?['Business']:[]).concat(['Qty sold','Price','Total amount']),
-    soldRows:sold.map((r,i)=>[i+1, r.name, r.model].concat(multi?[bizName(r.biz)]:[]).concat([r.qty, r.inMaster?fmtMoney(r.price):'—', fmtMoney(r.amount)])),
-    unsoldHead:['#','Product','Model No.'].concat(multi?['Business']:[]).concat(['In stock','Price']),
-    unsoldRows:unsold.map((r,i)=>[i+1, r.name, r.model].concat(multi?[bizName(r.biz)]:[]).concat([r.stock, fmtMoney(r.price)]))};
+    soldHead:['#','Product'].concat(byModel?['Model No.']:[]).concat(multi?['Business']:[]).concat(['Memos','Qty sold','Total amount']),
+    soldRows:sold.map((r,i)=>[i+1, r.name].concat(byModel?[r.model||'—']:[]).concat(multi?[bizName(r.biz)]:[]).concat([r.memos, r.qty, fmtMoney(r.amount)])),
+    soldTotal:['','Total'].concat(byModel?['']:[]).concat(multi?['']:[]).concat([totMemos, totQty, fmtMoney(totAmt)]),
+    unsoldHead:['#','Product'].concat(byModel?['Model No.']:[]).concat(multi?['Business']:[]).concat(byModel?['In stock','Price']:['Models in list','In stock']),
+    unsoldRows:unsold.map((r,i)=>[i+1, r.name].concat(byModel?[r.model||'—']:[]).concat(multi?[bizName(r.biz)]:[]).concat(byModel?[r.stock, fmtMoney(r.price)]:[r.models, r.stock]))};
 }
 function analyticsScopeLine(t, withRange){
   return `<div style="font-size:13px; margin-bottom:8px;"><b>Scope:</b> ${esc(t.multi?'All businesses':bizName(anState.biz))} &nbsp; ${withRange?`<b>Date range:</b> ${esc(anRangeLabel())} &nbsp; `:''}<b>Printed:</b> ${esc(new Date().toLocaleString())}</div>`;
@@ -5509,16 +5689,15 @@ function analyticsOverviewPrintHtml(){
     <h3>Salesman ranking (${anState.scope==='period'?'target period':'all memos'})</h3>${tableHtml(t.rankHead, t.rankRows.slice(0,40))}`;
 }
 function analyticsSoldPrintHtml(){
-  const t = analyticsTables(), totAmt = t.sold.reduce((a,r)=>a+r.amount,0), totQty = t.sold.reduce((a,r)=>a+r.qty,0);
-  const rows = t.soldRows.concat(t.sold.length ? [['Total','',''].concat(t.multi?['']:[]).concat([totQty, '', fmtMoney(totAmt)])] : []);
+  const t = analyticsTables();
   return analyticsScopeLine(t, true)
-    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.sold.length} product(s) sold, highest ${anState.sort==='qty'?'quantity':'amount'} first. Total amount = quantity sold × price in Product Details.</div>`
-    + tableHtml(t.soldHead, rows);
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.sold.length} product(s) sold, highest ${anState.sort==='qty'?'quantity':'amount'} first, ${t.byModel?'grouped by product name + model':'grouped by product name'} exactly as typed on the memos. Total amount = the memo total; when a memo has several products it is shared between them.</div>`
+    + tableHtml(t.soldHead, t.soldRows.concat(t.sold.length ? [t.soldTotal] : []));
 }
 function analyticsUnsoldPrintHtml(){
   const t = analyticsTables();
   return analyticsScopeLine(t, true)
-    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.unsold.length} product(s) in Product Details with no sales ${(anState.from||anState.to)?'in this date range':'yet'}.</div>`
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.unsold.length} ${t.byModel?'product(s)':'product name(s)'} in Product Details with no sales ${(anState.from||anState.to)?'in this date range':'yet'}.</div>`
     + tableHtml(t.unsoldHead, t.unsoldRows);
 }
 function analyticsExcel(){
@@ -5527,7 +5706,7 @@ function analyticsExcel(){
   try{
     const wb = XLSX.utils.book_new();
     const add = (name, head, rows)=>XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head, ...(rows.length?rows:[[]])]), name);
-    add('Product-wise sales', t.soldHead, t.soldRows); add('Products not sold', t.unsoldHead, t.unsoldRows);
+    add('Product-wise sales', t.soldHead, t.soldRows.concat(t.sold.length?[t.soldTotal]:[])); add('Products not sold', t.unsoldHead, t.unsoldRows);
     add('Salesman ranking', t.rankHead, t.rankRows); add('Month-wise trend', t.trendHead, t.trendRows); add('Target pace', t.paceHead, t.pace);
     XLSX.writeFile(wb, 'promaxis_analytics_'+todayStr()+'.xlsx'); toast('Excel file downloaded');
   }catch(e){ toast('Excel export failed: '+e.message, 'danger'); }
@@ -5579,7 +5758,7 @@ function renderAudit(){
     <div class="toolbar">
       <select id="auAct"><option value="">All actions</option>${acts.map(a=>`<option value="${a}" ${auState.act===a?'selected':''}>${a}</option>`).join('')}</select>
       <select id="auBiz"><option value="">All businesses</option>${BUSINESSES.map(b=>`<option value="${b.key}" ${auState.biz===b.key?'selected':''}>${esc(bizName(b.key))}</option>`).join('')}</select>
-      <div class="search-box"><span class="ic">🔎</span><input id="auQ" placeholder="Search memo, name, PC…" value="${esc(auState.q)}"/></div>
+      <div class="search-box"><span class="ic">🔎</span><input id="auQ" type="text" name="pmx_search" autocomplete="off" spellcheck="false" placeholder="Search memo, name, PC…" value="${esc(auState.q)}"/></div>
       <span class="spacer"></span><span class="badge-count">${all.length} record(s)</span>
       <button class="btn" id="btnAuditExcel" type="button">⇩ Excel</button>
     </div>
@@ -5665,8 +5844,8 @@ function waNumber(raw){
   return d;
 }
 function waLink(phone, text){ const n = waNumber(phone); return 'https://wa.me/'+(n?n:'')+'?text='+encodeURIComponent(text); }
-const moneyPlain = n => (getSettings().currency||'৳')+Math.round(Number(n)||0).toLocaleString('en-US');
-const moneyExact = n => (getSettings().currency||'৳')+(Math.round((Number(n)||0)*100)/100).toLocaleString('en-US',{maximumFractionDigits:2});
+const moneyPlain = n => (getSettings().currency||'৳')+' '+Math.round(Number(n)||0).toLocaleString('en-US');
+const moneyExact = n => (getSettings().currency||'৳')+' '+(Math.round((Number(n)||0)*100)/100).toLocaleString('en-US',{maximumFractionDigits:2});
 function waVars(bk, name){
   const st = salesmanStats(bk, name), pc = paceInfo(bk, st.periodTotal, st.target), inc = st.incentive;
   return {name, business:bizName(bk), period:targetPeriodLabel(bk), target:moneyPlain(st.target), achieved:moneyPlain(st.periodTotal), pct:String(st.pct),
