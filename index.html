@@ -667,7 +667,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.6.1";
+const APP_VERSION = "4.7.1";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -1309,7 +1309,7 @@ function undoToast(msg, trashId, type){
 }
 
 /* ---------------- Stock ---------------- */
-function stockCfg(){ return Object.assign({auto:true, low:10}, Store.get('stock_cfg', {})); }
+function stockCfg(){ return Object.assign({auto:true, low:10, alerts:true}, Store.get('stock_cfg', {})); }
 function productFor(products, it){
   let p = it.modelNumber ? products.find(x=>x.modelNumber===it.modelNumber) : null;
   if(!p && it.productName) p = products.find(x=>x.productName===it.productName);
@@ -1356,7 +1356,7 @@ function saveSales(bizKey, list, opts){
     d.changed.forEach(c=>{ accStock(prods, c.old.items, +1, dm); accStock(prods, c.now.items, -1, dm); });
     if(!opts.noStockRestore && d.removed.length){ d.removed.forEach(e=>accStock(prods, e.items, +1, dm)); stockRestored = true; }
     const crossed = stockApply(bizKey, prods, dm);
-    if(crossed.length) toast('⚠ Low stock: '+crossed.slice(0,3).map(p=>`${p.productName} ${p.modelNumber} (${p.quantity} left)`).join(', ')+(crossed.length>3?` +${crossed.length-3} more`:''), 'danger');
+    if(crossed.length && stockCfg().alerts) toast('⚠ Low stock: '+crossed.slice(0,3).map(p=>`${p.productName} ${p.modelNumber} (${p.quantity} left)`).join(', ')+(crossed.length>3?` +${crossed.length-3} more`:''), 'danger');
   }
   if(d.removed.length){
     tombAdd(d.removed.map(r=>r.id));
@@ -1997,7 +1997,7 @@ function excelFromRows(sheetName, headers, rows, filenameHint){
    memos, products, salesmen/targets, session periods and settings, all in
    one .xlsx file. This is a human-readable safety copy alongside the exact
    .json backup (which is what "Restore" reads back in). */
-function downloadFullBackupExcel(){
+function downloadFullBackupExcel(returnWb){
   try{
     const wb = XLSX.utils.book_new();
     function addSheet(name, headers, rows){
@@ -2044,6 +2044,7 @@ function downloadFullBackupExcel(){
       ['Exported At', new Date().toLocaleString()],
     ]);
 
+    if(returnWb) return wb;
     XLSX.writeFile(wb, 'promaxis_backup_'+todayStr()+'.xlsx');
     markBackupDone();
     toast('Excel backup downloaded');
@@ -3388,7 +3389,7 @@ function renderProductsView(bizKey){
             <td>${esc(p.productName)}</td>
             <td class="mono">${esc(p.modelNumber)}</td>
             <td class="right mono">${fmtMoney(p.price)}</td>
-            <td class="right mono">${p.quantity}${isLowStock(p) ? ` <span class="pill pill-dup" title="At or below the low-stock alert level (${lowLevel(p)})">${(Number(p.quantity)||0)<=0?'Out':'Low'}</span>` : ''}</td>
+            <td class="right mono">${p.quantity}</td>
             <td class="right mono">${p.targetQuantity}</td>
             <td class="right mono">${ach}</td>
             <td class="right mono">${fmtMoney(p.spQty||0)}</td>
@@ -4333,7 +4334,7 @@ function renderBackup(){
     markBackupDone();
   };
 
-  view.insertAdjacentHTML('beforeend', syncCardsHtml()); wireSyncCards();
+  view.insertAdjacentHTML('beforeend', syncCardsHtml()+driveBackupCardHtml()); wireSyncCards(); wireDriveBackupCard();
   const typeSel = document.getElementById('restoreType');
   const bizWrap = document.getElementById('restoreBizWrap');
   const salesmanWrap = document.getElementById('restoreSalesmanWrap');
@@ -4774,10 +4775,10 @@ const DEFAULT_CLIENT_ID = '433002204786-5cqcefrlvihjfltvvd5ptqcsurf7pd2m.apps.go
 const DEFAULT_GMAIL = 'nailsandwood2016@gmail.com';
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UP = 'https://www.googleapis.com/upload/drive/v3/files';
-const _sync = {state:'off', busy:false, dirty:false, seq:0, timer:null, applying:false, token:null, rerun:false, err:'', armed:false};
+const _sync = {state:'off', busy:false, dirty:false, seq:0, timer:null, applying:false, token:null, rerun:false, err:'', armed:false, remoteVersion:null, firstPending:0};
 
 function syncCfg(){
-  const c = Object.assign({clientId:'', hint:'', enabled:false, fileId:'', device:'', consented:false, last:null}, Store.get('sync_cfg', {}));
+  const c = Object.assign({clientId:'', hint:'', enabled:false, fileId:'', device:'', consented:false, last:null, backupFolderId:'', autoDrive:true, lastAuto:''}, Store.get('sync_cfg', {}));
   if(!c.clientId) c.clientId = DEFAULT_CLIENT_ID;
   if(!c.hint) c.hint = DEFAULT_GMAIL;
   return c;
@@ -4819,9 +4820,9 @@ function loadGis(){
   return _gisPromise;
 }
 /* mode: 'interactive' (user just clicked), 'gesture' (inside a click, may open the popup), 'silent' (background) */
-function gdToken(mode){
+function gdToken(mode, force){
   return new Promise((resolve, reject)=>{
-    if(_sync.token && _sync.token.exp > Date.now()+60000) return resolve(_sync.token.value);
+    if(!force && _sync.token && _sync.token.exp > Date.now()+60000) return resolve(_sync.token.value);
     const cfg = syncCfg();
     if(!cfg.clientId) return reject(Object.assign(new Error('Add your Google Client ID first'), {code:'noclient'}));
     loadGis().then(()=>{
@@ -4843,6 +4844,17 @@ function gdToken(mode){
     }).catch(e=>reject(e.code ? e : Object.assign(e, {code:'load'})));
   });
 }
+/* ---- gzip helpers: the sync file is compressed (roughly 8x smaller), which is what makes a sync take ~1 second ---- */
+const canGzip = typeof CompressionStream!=='undefined' && typeof DecompressionStream!=='undefined';
+async function gzipText(text){
+  if(!canGzip) return new Blob([text], {type:'application/json'});
+  return new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'))).blob();
+}
+async function blobToText(blob){
+  const head = new Uint8Array(await blob.slice(0,2).arrayBuffer());
+  if(head[0]===0x1f && head[1]===0x8b) return new Response(blob.stream().pipeThrough(new DecompressionStream('gzip'))).text();
+  return blob.text();
+}
 async function gdApi(token, url, init){
   const r = await fetch(url, Object.assign({}, init, {headers:Object.assign({Authorization:'Bearer '+token}, (init && init.headers) || {})}));
   if(r.status===401){ _sync.token = null; throw Object.assign(new Error('Google session expired'), {code:'auth'}); }
@@ -4855,15 +4867,18 @@ async function gdFindFile(token){
   return (j.files && j.files[0]) || null;
 }
 async function gdMeta(token, id){ return (await gdApi(token, `${DRIVE}/${id}?fields=id,version,modifiedTime`)).json(); }
-async function gdRead(token, id){ return (await gdApi(token, `${DRIVE}/${id}?alt=media`)).json(); }
-async function gdCreate(token, obj){
+async function gdRead(token, id){ return JSON.parse(await blobToText(await (await gdApi(token, `${DRIVE}/${id}?alt=media`)).blob())); }
+/* generic multipart create (metadata + file body) */
+async function gdMultipart(token, metadata, contentType, body){
   const b = 'pmx'+Math.random().toString(36).slice(2);
-  const body = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({name:SYNC_FILE, mimeType:'application/json'})}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(obj)}\r\n--${b}--`;
-  return (await gdApi(token, `${DRIVE_UP}?uploadType=multipart&fields=id,version`, {method:'POST', headers:{'Content-Type':'multipart/related; boundary='+b}, body})).json();
+  const blob = new Blob([`--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${b}\r\nContent-Type: ${contentType}\r\n\r\n`, body, `\r\n--${b}--`]);
+  return (await gdApi(token, `${DRIVE_UP}?uploadType=multipart&fields=id,version,name,webViewLink`, {method:'POST', headers:{'Content-Type':'multipart/related; boundary='+b}, body:blob})).json();
 }
-async function gdUpdate(token, id, obj){
-  return (await gdApi(token, `${DRIVE_UP}/${id}?uploadType=media&fields=id,version`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(obj)})).json();
+async function gdPut(token, id, contentType, body){
+  return (await gdApi(token, `${DRIVE_UP}/${id}?uploadType=media&fields=id,version`, {method:'PATCH', headers:{'Content-Type':contentType}, body})).json();
 }
+async function gdCreate(token, obj){ const blob = await gzipText(JSON.stringify(obj)); return gdMultipart(token, {name:SYNC_FILE, mimeType:'application/octet-stream'}, 'application/octet-stream', blob); }
+async function gdUpdate(token, id, obj){ const blob = await gzipText(JSON.stringify(obj)); return gdPut(token, id, 'application/octet-stream', blob); }
 function applyMergedState(local, merged){
   let changed = 0;
   _sync.applying = true;
@@ -4874,20 +4889,45 @@ function applyMergedState(local, merged){
   if(changed){ rebuildShadows(); applyTheme(getSettings()); }
   return changed;
 }
+const tokenAlive = (minMs)=>!!(_sync.token && _sync.token.exp > Date.now()+(minMs||0));
+/* Google only hands out 1-hour tokens to a web page. A click/keypress is needed to renew one (browsers block pop-ups otherwise),
+   so the next click after the token gets old renews it quietly and syncing carries on. */
 function armReauth(){
   if(_sync.armed) return;
   _sync.armed = true;
-  const h = ()=>{ document.removeEventListener('pointerdown', h, true); _sync.armed = false; syncNow({gesture:true}); };
-  document.addEventListener('pointerdown', h, true);
+  const h = ()=>{
+    document.removeEventListener('pointerdown', h, true); document.removeEventListener('keydown', h, true);
+    _sync.armed = false;
+    gdToken('gesture', true).then(()=>{ _sync.state = 'ok'; _sync.err = ''; updateSyncBadge(); syncNow({}); })
+      .catch(e=>{ if(!tokenAlive(0)){ _sync.state = 'reconnect'; _sync.err = e.message; updateSyncBadge(); armReauth(); } });
+  };
+  document.addEventListener('pointerdown', h, true); document.addEventListener('keydown', h, true);
 }
+let _pendingRefresh = false, _lastPullToast = 0;
+function viewIsBusy(){
+  if(document.getElementById('modalRoot').children.length>0) return 'modal';
+  const ae = document.activeElement;
+  if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) && document.getElementById('view').contains(ae)) return 'typing';
+  return '';
+}
+function refreshAfterPull(){
+  const busy = viewIsBusy();
+  if(busy){ _pendingRefresh = true; if(busy==='modal') toast('☁ New data arrived from another PC — it shows when you close this window'); return; }
+  buildSidebar(); route();
+  if(Date.now()-_lastPullToast > 8000){ toast('☁ Updated with changes from another PC'); _lastPullToast = Date.now(); }
+}
+document.addEventListener('focusout', ()=>{ if(_pendingRefresh) setTimeout(()=>{ if(!viewIsBusy()){ _pendingRefresh = false; buildSidebar(); route(); } }, 200); });
+document.addEventListener('click', ()=>{ if(_pendingRefresh) setTimeout(()=>{ if(!viewIsBusy()){ _pendingRefresh = false; buildSidebar(); route(); } }, 300); });
+
 async function syncNow(opts){
   opts = opts || {};
   const cfg = syncCfg();
   if(!cfg.clientId || (!cfg.enabled && !opts.force)) return false;
   if(_sync.busy){ _sync.rerun = true; return false; }
   if(!navigator.onLine){ updateSyncBadge(); return false; }
-  _sync.busy = true; _sync.state = 'syncing'; _sync.err = ''; updateSyncBadge();
-  let ok = false, pulled = 0;
+  _sync.busy = true; _sync.firstPending = 0;
+  if(_sync.state!=='ok' || opts.manual) { _sync.state = 'syncing'; _sync.err = ''; updateSyncBadge(); }
+  let ok = false, pulled = 0, didWork = false;
   try{
     const token = await gdToken(opts.interactive ? 'interactive' : (opts.gesture ? 'gesture' : 'silent'));
     for(let attempt=1; ; attempt++){
@@ -4895,26 +4935,35 @@ async function syncNow(opts){
       const fid = syncCfg().fileId;
       if(fid){ try{ file = await gdMeta(token, fid); }catch(e){ if(e.status!==404) throw e; } }
       if(!file){ file = await gdFindFile(token); if(file) setSyncCfg({fileId:file.id}); }
-      let remote = null;
-      if(file){ const doc = await gdRead(token, file.id); if(doc && doc.state) remote = doc; }
+      const remoteUnchanged = !!(file && _sync.remoteVersion && String(file.version)===_sync.remoteVersion);
+      if(remoteUnchanged && !_sync.dirty && !opts.manual) break;          /* nothing new on either side */
       const local = buildSyncState(), seqAtLocal = _sync.seq;
-      const merged = remote ? mergeStates(Store.get('sync_base', {}), local, remote.state) : local;
-      const needUpload = !remote || !jsonEq(merged, remote.state);
-      if(needUpload && file && attempt<3){
-        const again = await gdMeta(token, file.id);          /* someone else saved while we were merging? merge again */
-        if(again.version !== file.version) continue;
+      let merged, needUpload;
+      if(remoteUnchanged){                                                 /* fast path: only this PC changed anything */
+        merged = local; needUpload = true;
+      } else {
+        let remote = null;
+        if(file){ const doc = await gdRead(token, file.id); if(doc && doc.state) remote = doc; }
+        merged = remote ? mergeStates(Store.get('sync_base', {}), local, remote.state) : local;
+        needUpload = !remote || !jsonEq(merged, remote.state);
+        if(needUpload && file && attempt<3){
+          const again = await gdMeta(token, file.id);                      /* someone else saved while we were merging? merge again */
+          if(String(again.version) !== String(file.version)) continue;
+        }
+        pulled = applyMergedState(local, merged);
+        _sync.remoteVersion = file ? String(file.version) : null;
       }
-      pulled = applyMergedState(local, merged);
       if(needUpload){
-        const payload = {format:'promaxis-sync', v:1, appVersion:APP_VERSION, savedAt:new Date().toISOString(), device:deviceName(), state:merged};
+        const payload = {format:'promaxis-sync', v:2, appVersion:APP_VERSION, savedAt:new Date().toISOString(), device:deviceName(), state:merged};
         const res = file ? await gdUpdate(token, file.id, payload) : await gdCreate(token, payload);
-        setSyncCfg({fileId:res.id});
+        setSyncCfg({fileId:res.id}); _sync.remoteVersion = String(res.version);
       }
       Store.set('sync_base', JSON.parse(JSON.stringify(merged)));
       _sync.dirty = (_sync.seq !== seqAtLocal);
+      didWork = true;
       break;
     }
-    setSyncCfg({last:new Date().toISOString()});
+    if(didWork || opts.manual) setSyncCfg({last:new Date().toISOString()});
     if(opts.force && !cfg.enabled) setSyncCfg({enabled:true});
     _sync.state = 'ok'; ok = true;
   }catch(e){
@@ -4926,25 +4975,47 @@ async function syncNow(opts){
     } else {
       _sync.state = 'error'; _sync.err = (e && e.message) || 'Unknown error';
       if(opts.interactive || opts.manual) toast('Sync failed: '+_sync.err, 'danger');
-      scheduleSync(60000);
+      scheduleSync(5000);
     }
   } finally {
     _sync.busy = false;
     updateSyncBadge();
-    if(_sync.rerun){ _sync.rerun = false; scheduleSync(2000); }
+    if(_sync.rerun){ _sync.rerun = false; scheduleSync(500); }
   }
-  if(ok && pulled){
-    if(document.getElementById('modalRoot').children.length===0){ buildSidebar(); route(); toast('☁ Updated with changes from another PC'); }
-    else toast('☁ New data arrived from another PC — close this window to see it');
-  } else if(ok && (opts.manual || opts.interactive)) toast('☁ Synced');
-  if(ok && _sync.dirty) scheduleSync(3000);
+  if(ok && pulled) refreshAfterPull();
+  else if(ok && (opts.manual || opts.interactive)) toast('☁ Synced');
+  if(ok && _sync.dirty) scheduleSync(800);
+  if(ok && didWork) maybeDriveAutoBackup();
   return ok;
 }
+/* changes are sent about 1 second after the last edit (never later than 5 seconds into a long burst of edits) */
 function scheduleSync(ms){
   clearTimeout(_sync.timer);
   if(!syncCfg().enabled) return;
-  _sync.timer = setTimeout(()=>syncNow({}), ms || 15000);
+  if(ms===undefined){
+    if(!_sync.firstPending) _sync.firstPending = Date.now();
+    ms = Math.max(200, Math.min(1000, 5000-(Date.now()-_sync.firstPending)));
+  }
+  _sync.timer = setTimeout(()=>syncNow({}), ms);
 }
+/* other PCs are checked every 2 seconds with a tiny "has the file changed?" request */
+let _pollTimer = null;
+async function pollOnce(){
+  const cfg = syncCfg();
+  if(!cfg.enabled || _sync.busy || !navigator.onLine || !cfg.fileId) return;
+  if(!tokenAlive(0)){ if(_sync.state!=='reconnect'){ _sync.state = 'reconnect'; updateSyncBadge(); } armReauth(); return; }
+  if(!tokenAlive(8*60000)) armReauth();                  /* renew in the background on the next click, before it runs out */
+  if(_sync.dirty) return;                                  /* our own push is already queued */
+  try{
+    const m = await gdMeta(_sync.token.value, cfg.fileId);
+    if(String(m.version) !== _sync.remoteVersion) syncNow({});
+  }catch(e){ if(e.code==='auth'){ _sync.token = null; } }
+}
+function pollLoop(){
+  clearTimeout(_pollTimer);
+  _pollTimer = setTimeout(async ()=>{ try{ await pollOnce(); }catch(e){} pollLoop(); }, document.hidden ? 15000 : 2000);
+}
+
 let _snapTimer = null;
 function snapshotKeys(){ return Object.keys(_cache).filter(k=>k.indexOf('autobak_')===0).sort(); }
 function scheduleSnapshot(){ clearTimeout(_snapTimer); _snapTimer = setTimeout(()=>maybeSnapshot(false), 120000); }
@@ -4964,12 +5035,14 @@ function startSyncEngine(){
   };
   const badge = document.getElementById('syncBadge');
   if(badge) badge.onclick = ()=>{ if(_sync.state==='reconnect' || _sync.state==='error') syncNow({interactive:true, manual:true}); else location.hash = 'backup'; };
-  window.addEventListener('online', ()=>{ updateSyncBadge(); scheduleSync(1500); });
+  window.addEventListener('online', ()=>{ updateSyncBadge(); scheduleSync(500); });
   window.addEventListener('offline', updateSyncBadge);
-  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && syncCfg().enabled) scheduleSync(1500); });
-  setInterval(()=>{ if(!document.hidden && syncCfg().enabled && !_sync.dirty) syncNow({}); }, 5*60*1000);
+  const wake = ()=>{ if(!document.hidden && syncCfg().enabled){ pollOnce(); } };
+  document.addEventListener('visibilitychange', wake);
+  window.addEventListener('focus', wake);
   updateSyncBadge();
-  if(syncCfg().enabled) setTimeout(()=>syncNow({}), 1500);
+  if(syncCfg().enabled){ setTimeout(()=>syncNow({}), 300); armReauth(); }   /* armed so the very first click (e.g. the login button) can renew Google access */
+  pollLoop();
   setTimeout(()=>maybeSnapshot(false), 4000);
 }
 
@@ -4978,6 +5051,7 @@ function syncCardsHtml(){
   return `
     <div class="card" id="syncCard" style="margin-top:16px;">
       <div class="section-head"><h2>☁️ Multi-PC Sync — Google Drive</h2><span class="badge-count" id="syncStatusPill">…</span></div>
+      ${location.protocol==='file:' ? `<div style="background:#FFF3D6; color:#8A6300; border-radius:8px; padding:10px 12px; font-size:13px; margin-bottom:12px;"><b>⚠ This page is opened from a folder (file://).</b> Google sign-in does not work from here (it shows “Access blocked: invalid_request”). Open the app from its https address — for example your GitHub Pages link — and connect from there.</div>` : ''}
       <p class="text-soft" style="font-size:13px; margin-bottom:10px;">Use the same Google account on every PC and they all show the same data. Memos entered on different PCs are <b>merged</b> — nothing is overwritten. Connect your main PC first; on other PCs, connect <b>before</b> entering new data.</p>
       <div class="field-row">
         <div class="field"><label>Google Client ID</label><input type="text" id="syncClientId" value="${esc(cfg.clientId)}" placeholder="xxxxxxxx.apps.googleusercontent.com" autocomplete="off"/></div>
@@ -5016,6 +5090,7 @@ function wireSyncCards(){
   const readCfg = ()=>({clientId:document.getElementById('syncClientId').value.trim(), hint:document.getElementById('syncHint').value.trim(), device:document.getElementById('syncDevice').value.trim()});
   document.getElementById('syncDevice').onchange = ()=>setSyncCfg({device:readCfg().device});
   document.getElementById('btnSyncConnect').onclick = async ()=>{
+    if(location.protocol==='file:'){ toast('Google sign-in does not work when the app is opened from a folder. Open it from your https address (GitHub Pages) and connect there.', 'danger'); return; }
     const c = readCfg();
     if(!/\.apps\.googleusercontent\.com$/.test(c.clientId)){ toast('Paste the full Client ID (ends with .apps.googleusercontent.com)', 'danger'); return; }
     setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2)});
@@ -5043,6 +5118,159 @@ function wireSyncCards(){
     });
   });
   document.getElementById('btnSnapNow').onclick = ()=>{ maybeSnapshot(true); toast('Snapshot saved'); renderBackup(); };
+}
+
+
+/* =========================================================
+   Backups saved to Google Drive: JSON, Excel, PDF (+ a daily automatic JSON)
+   Files go into a "PROMAXIS Backups" folder in the connected Google Drive.
+   ========================================================= */
+const BACKUP_FOLDER = 'PROMAXIS Backups';
+const AUTO_KEEP = 14;
+function nowStamp(){ const d = new Date(); return todayStr()+'_'+String(d.getHours()).padStart(2,'0')+String(d.getMinutes()).padStart(2,'0'); }
+async function driveToken(interactive){
+  if(!syncCfg().clientId) throw Object.assign(new Error('Add your Google Client ID in the sync card first'), {code:'noclient'});
+  return gdToken(interactive ? 'interactive' : 'silent');
+}
+let _folderPromise = null;
+function gdEnsureFolder(token){
+  if(!_folderPromise) _folderPromise = _ensureFolder(token).finally(()=>{ _folderPromise = null; });
+  return _folderPromise;
+}
+async function _ensureFolder(token){
+  const cfg = syncCfg();
+  if(cfg.backupFolderId){ try{ const m = await gdMeta(token, cfg.backupFolderId); if(m && m.id) return cfg.backupFolderId; }catch(e){ if(e.status!==404) throw e; } }
+  const find = async ()=>{
+    const q = encodeURIComponent("name='"+BACKUP_FOLDER+"' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+    return ((await (await gdApi(token, `${DRIVE}?q=${q}&fields=files(id,createdTime)&orderBy=createdTime&spaces=drive`)).json()).files) || [];
+  };
+  let list = await find(), id;
+  if(list.length) id = list[0].id;                                   /* the oldest folder wins, so every PC settles on the same one */
+  else {
+    const r = await gdApi(token, `${DRIVE}?fields=id`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:BACKUP_FOLDER, mimeType:'application/vnd.google-apps.folder'})});
+    const mine = (await r.json()).id;
+    list = await find();                                             /* did another PC create one at the same moment? */
+    id = list.length ? list[0].id : mine;
+    if(id!==mine){ try{ await gdDelete(token, mine); }catch(e){} }
+  }
+  setSyncCfg({backupFolderId:id});
+  return id;
+}
+/* every backup file this app has made (they all start with promaxis_), wherever they sit */
+async function gdListBackups(token, nameContains){
+  const q = `trashed=false and name contains '${nameContains}'`;
+  const j = await (await gdApi(token, `${DRIVE}?q=${encodeURIComponent(q)}&fields=files(id,name,size,createdTime,webViewLink,mimeType)&orderBy=createdTime%20desc&pageSize=100&spaces=drive`)).json();
+  return j.files || [];
+}
+async function gdDelete(token, id){ await gdApi(token, `${DRIVE}/${id}`, {method:'DELETE'}); }
+async function gdUploadBackup(token, folderId, name, mime, body){
+  return gdMultipart(token, {name, parents:[folderId], mimeType:mime}, mime, body);
+}
+
+/* ---- the three file types ---- */
+function backupJsonBlob(){ return new Blob([JSON.stringify(collectFullState())], {type:'application/json'}); }
+function backupXlsxBlob(){
+  if(typeof XLSX==='undefined') throw new Error('The Excel library needs internet once — connect to the internet and try again');
+  const wb = downloadFullBackupExcel(true);
+  if(!wb) throw new Error('Could not build the Excel file');
+  const arr = XLSX.write(wb, {type:'array', bookType:'xlsx'});
+  return new Blob([arr], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+}
+/* The PDF is produced by Google itself: the report is uploaded as a Google Doc, exported as PDF, and the temporary Doc is removed.
+   (That is what makes Bangla text and the ৳ sign print correctly.) */
+function backupReportHtml(){
+  let body = fullDataPreviewHtml();
+  body = body.replace(/<svg[\s\S]*?<\/svg>/g, '').replace(/<table/g, '<table border="1" cellspacing="0" cellpadding="5" style="border-collapse:collapse; width:100%; font-size:10pt;"').replace(/<th(\s|>)/g, '<th style="background:#0E1E3A; color:#ffffff;"$1');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>PROMAXIS data ${todayStr()}</title></head><body style="font-family:Arial,sans-serif;"><h2>${esc(getSettings().companyName||'PROMAXIS')} — Complete data</h2><p>Saved ${esc(new Date().toLocaleString())}</p>${body}</body></html>`;
+}
+async function gdMakePdf(token, folderId, name){
+  const html = new Blob([backupReportHtml()], {type:'text/html'});
+  const doc = await gdMultipart(token, {name:name+' (temp)', mimeType:'application/vnd.google-apps.document'}, 'text/html', html);
+  try{
+    const pdf = await (await gdApi(token, `${DRIVE}/${doc.id}/export?mimeType=application%2Fpdf`)).blob();
+    return await gdUploadBackup(token, folderId, name, 'application/pdf', pdf);
+  } finally { try{ await gdDelete(token, doc.id); }catch(e){} }
+}
+async function saveBackupToDrive(kind){
+  const labels = {json:'JSON', xlsx:'Excel', pdf:'PDF'};
+  try{
+    toast('Saving '+labels[kind]+' to Google Drive…');
+    const token = await driveToken(true), folderId = await gdEnsureFolder(token), base = 'promaxis_backup_'+nowStamp();
+    let res;
+    if(kind==='json') res = await gdUploadBackup(token, folderId, base+'.json', 'application/json', backupJsonBlob());
+    else if(kind==='xlsx') res = await gdUploadBackup(token, folderId, base+'.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', backupXlsxBlob());
+    else res = await gdMakePdf(token, folderId, base+'.pdf');
+    markBackupDone();
+    toast('✓ '+labels[kind]+' saved to Google Drive → “'+BACKUP_FOLDER+'” folder');
+    auditAdd([{act:'sync', txt:labels[kind]+' backup saved to Google Drive ('+res.name+')'}]);
+    return res;
+  }catch(e){
+    const hint = kind==='pdf' ? ' (Large data can exceed Google’s conversion limit — use the JSON or Excel backup, or “Download Complete Data (.pdf)”.)' : '';
+    toast('Could not save to Google Drive: '+((e && e.message)||'unknown error')+hint, 'danger');
+    return null;
+  }
+}
+/* one automatic JSON backup a day, newest 14 kept */
+let _autoBusy = false;
+async function maybeDriveAutoBackup(){
+  const cfg = syncCfg();
+  if(!cfg.enabled || cfg.autoDrive===false || cfg.lastAuto===todayStr() || _autoBusy || !tokenAlive(60000)) return;
+  if(!BUSINESSES.some(b=>getSales(b.key).length || getProducts(b.key).length)) return;
+  _autoBusy = true;
+  try{
+    const token = _sync.token.value, folderId = await gdEnsureFolder(token), name = 'promaxis_auto_'+todayStr()+'.json';
+    const existing = await gdListBackups(token, 'promaxis_auto_');
+    if(!existing.some(f=>f.name===name)) await gdUploadBackup(token, folderId, name, 'application/json', backupJsonBlob());
+    for(const f of existing.filter(f=>f.name!==name).sort((a,b)=>b.name.localeCompare(a.name)).slice(AUTO_KEEP-1)) await gdDelete(token, f.id);
+    setSyncCfg({lastAuto:todayStr()});
+  }catch(e){ /* try again on a later sync */ }
+  finally{ _autoBusy = false; }
+}
+function fmtBytes(n){ n = Number(n)||0; return n>=1048576 ? (n/1048576).toFixed(1)+' MB' : n>=1024 ? Math.round(n/1024)+' KB' : n+' B'; }
+function driveBackupCardHtml(){
+  const cfg = syncCfg();
+  return `
+    <div class="card" id="driveBackupCard" style="margin-top:16px;">
+      <div class="section-head"><h2>☁️ Save backup to Google Drive</h2><span class="badge-count">folder: ${esc(BACKUP_FOLDER)}</span></div>
+      <p class="text-soft" style="font-size:13px; margin-bottom:10px;">Saves a copy straight into your Google Drive (${esc(cfg.hint||'connected account')}). No download needed.</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-primary" id="btnDriveJson" type="button">☁ Save JSON to Drive</button>
+        <button class="btn btn-accent" id="btnDriveXlsx" type="button">☁ Save Excel to Drive</button>
+        <button class="btn btn-accent" id="btnDrivePdf" type="button">☁ Save PDF to Drive</button>
+      </div>
+      <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-top:12px;"><input type="checkbox" id="driveAuto" ${cfg.autoDrive!==false?'checked':''}/> Also save one JSON backup to Drive automatically every day (newest ${AUTO_KEEP} kept)</label>
+      <p class="hint">JSON is the exact backup that “Restore” reads. The PDF is made by Google from the complete-data report; for very large data use JSON or Excel.</p>
+      <div class="section-head" style="margin-top:14px;"><h3>Backups in your Drive</h3><button class="btn btn-sm btn-ghost" id="btnDriveList" type="button">↻ Refresh list</button></div>
+      <div id="driveList" class="text-soft" style="font-size:13px;">Press “Refresh list” to see the files saved in Google Drive.</div>
+    </div>`;
+}
+function wireDriveBackupCard(){
+  const v = document.getElementById('view');
+  const guard = ()=>{ if(location.protocol==='file:'){ toast('Open the app from its https address to use Google Drive (Drive does not work from a folder).', 'danger'); return false; } return true; };
+  document.getElementById('btnDriveJson').onclick = async ()=>{ if(guard()){ await saveBackupToDrive('json'); loadDriveList(); } };
+  document.getElementById('btnDriveXlsx').onclick = async ()=>{ if(guard()){ await saveBackupToDrive('xlsx'); loadDriveList(); } };
+  document.getElementById('btnDrivePdf').onclick = async ()=>{ if(guard()){ await saveBackupToDrive('pdf'); loadDriveList(); } };
+  document.getElementById('driveAuto').onchange = e=>setSyncCfg({autoDrive:e.target.checked});
+  document.getElementById('btnDriveList').onclick = ()=>{ if(guard()) loadDriveList(true); };
+  async function loadDriveList(interactive){
+    const box = document.getElementById('driveList'); if(!box) return;
+    box.textContent = 'Loading…';
+    try{
+      const token = await driveToken(!!interactive), files = [].concat(await gdListBackups(token, 'promaxis_backup_'), await gdListBackups(token, 'promaxis_auto_')).sort((a,b)=>String(b.createdTime).localeCompare(String(a.createdTime)));
+      box.innerHTML = files.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>File</th><th>Saved</th><th class="right">Size</th><th>Actions</th></tr></thead><tbody>
+        ${files.map(f=>`<tr><td class="mono" style="font-size:12px;">${esc(f.name)}</td><td>${esc(new Date(f.createdTime).toLocaleString())}</td><td class="right mono">${fmtBytes(f.size)}</td>
+          <td>${f.webViewLink?`<a class="btn btn-sm btn-ghost" href="${esc(f.webViewLink)}" target="_blank" rel="noopener">Open</a> `:''}${/\.json$/.test(f.name)?`<button class="btn btn-sm btn-danger" data-drive-restore="${esc(f.id)}" data-name="${esc(f.name)}" type="button">Restore</button>`:''}</td></tr>`).join('')}
+        </tbody></table></div>` : 'No backups in Drive yet.';
+      box.querySelectorAll('[data-drive-restore]').forEach(b=>b.onclick = ()=>confirmDialog('Restore this Drive backup?', `Your current data is replaced by “${esc(b.dataset.name)}”. Whatever is on screen now goes to the Recycle Bin first, so it can be undone.`, async ()=>{
+        try{
+          const tk = await driveToken(true);
+          const state = JSON.parse(await blobToText(await (await gdApi(tk, `${DRIVE}/${b.dataset.driveRestore}?alt=media`)).blob()));
+          restoreFullState(state); toast('Backup restored from Google Drive'); buildSidebar(); route();
+        }catch(e){ toast('Could not restore: '+e.message, 'danger'); }
+      }));
+    }catch(e){ box.textContent = (e.code==='popup'||e.code==='auth') ? 'Press “Refresh list” to sign in to Google again.' : 'Could not load the list: '+e.message; }
+  }
+  if(syncCfg().enabled && tokenAlive(60000)) loadDriveList(false);
 }
 
 
@@ -5085,9 +5313,11 @@ function hBars(rows){
 }
 function monthKeyOf(d){ return /^\d{4}-\d{2}/.test(d||'') ? d.slice(0,7) : null; }
 function monthLabel(m){ return new Date(+m.slice(0,4), +m.slice(5,7)-1, 1).toLocaleDateString('en-GB', {month:'short', year:'2-digit'}); }
-function monthlyTrend(keys, maxMonths){
+function inRangeE(e, df, dt){ return inDateRange(e, df||'', dt||''); }
+function monthlyTrend(keys, maxMonths, df, dt){
   const agg = {};
   keys.forEach(bk=>getSales(bk).forEach(e=>{
+    if(!inRangeE(e, df, dt)) return;
     const m = monthKeyOf(e.date); if(!m) return;
     const a = agg[m] || (agg[m] = {total:0, promo:0, count:0});
     a.total += Number(e.total)||0; a.promo += entryPromoAmount(bk, e); a.count++;
@@ -5104,28 +5334,43 @@ function monthlyTrend(keys, maxMonths){
   }
   return out;
 }
-function rankSalesmen(keys, scope){
+function rankSalesmen(keys, scope, df, dt){
   const rows = [];
-  keys.forEach(bk=>allAccountStats(bk).forEach(s=>{
-    const v = scope==='period' ? s.periodTotal : s.total;
-    if(v>0) rows.push({biz:bk, name:s.name, value:v, pct:s.pct, target:s.target});
-  }));
+  keys.forEach(bk=>{
+    if(scope==='period'){
+      allAccountStats(bk).forEach(s=>{ if(s.periodTotal>0) rows.push({biz:bk, name:s.name, value:s.periodTotal, pct:s.pct, target:s.target}); });
+    } else {
+      const agg = {};
+      getSales(bk).forEach(e=>{ if(inRangeE(e, df, dt)) agg[e.salesman] = (agg[e.salesman]||0) + (Number(e.total)||0); });
+      Object.keys(agg).forEach(n=>{ if(agg[n]>0) rows.push({biz:bk, name:n, value:agg[n], pct:0, target:0}); });
+    }
+  });
   return rows.sort((a,b)=>b.value-a.value);
 }
-function rankProducts(keys){
-  const map = new Map();
+/* Every product that sold (best first) and, separately, every product in Product Details that did not sell.
+   Total amount = quantity sold × the product's price in Product Details. */
+function rankProducts(keys, df, dt, sortBy){
+  const map = new Map(), soldIds = new Set();
   keys.forEach(bk=>{
     const prods = getProducts(bk);
-    getSales(bk).forEach(e=>(e.items||[]).forEach(it=>{
-      const q = Number(it.qty)||0; if(!q) return;
-      const p = productFor(prods, it);
-      const k = bk+'|'+(p ? p.modelNumber : (it.modelNumber||it.productName));
-      const r = map.get(k) || {biz:bk, name:(p?p.productName:it.productName)||it.modelNumber, model:p?p.modelNumber:(it.modelNumber||''), qty:0, value:0};
-      r.qty += q; r.value += p ? (Number(p.price)||0)*q : 0;
-      map.set(k, r);
-    }));
+    getSales(bk).forEach(e=>{
+      if(!inRangeE(e, df, dt)) return;
+      (e.items||[]).forEach(it=>{
+        const q = Number(it.qty)||0; if(!q) return;
+        const p = productFor(prods, it);
+        const k = bk+'|'+(p ? p.id : (it.modelNumber||it.productName));
+        const r = map.get(k) || {biz:bk, name:(p?p.productName:it.productName)||it.modelNumber||'(unnamed)', model:p?p.modelNumber:(it.modelNumber||''), qty:0, amount:0, price:p?(Number(p.price)||0):0, inMaster:!!p};
+        r.qty += q; r.amount += r.price*q;
+        map.set(k, r);
+        if(p) soldIds.add(bk+'|'+p.id);
+      });
+    });
   });
-  return Array.from(map.values()).sort((a,b)=>b.qty-a.qty);
+  const sold = Array.from(map.values()).sort(sortBy==='qty' ? (a,b)=>b.qty-a.qty || b.amount-a.amount : (a,b)=>b.amount-a.amount || b.qty-a.qty);
+  const unsold = [];
+  keys.forEach(bk=>getProducts(bk).forEach(p=>{ if(!soldIds.has(bk+'|'+p.id)) unsold.push({biz:bk, name:p.productName||'', model:p.modelNumber||'', stock:Number(p.quantity)||0, price:Number(p.price)||0}); }));
+  unsold.sort((a,b)=>a.name.localeCompare(b.name));
+  return {sold, unsold};
 }
 function paceStatus(pc, pct){
   if(pc.state==='running') return pc.projPct>=100 ? {t:'On track', c:'pill-ok'} : pc.projPct>=80 ? {t:'Slightly behind', c:'pill-warn'} : {t:'Behind pace', c:'pill-dup'};
@@ -5149,23 +5394,43 @@ function paceCardHtml(bk){
     </div>
   </div>`;
 }
-let anState = {biz:'all', scope:'period'};
+let anState = {biz:'all', scope:'period', from:'', to:'', sort:'amount'};
+function anKeys(){ return anState.biz==='all' ? BUSINESSES.map(b=>b.key) : [anState.biz]; }
+function anRangeLabel(){ return (anState.from||anState.to) ? `${anState.from?fmtDateNice(anState.from):'start'} – ${anState.to?fmtDateNice(anState.to):'today'}` : 'All dates'; }
+function paceRows(keys){
+  return keys.map(bk=>{
+    const stats = allAccountStats(bk), achieved = stats.reduce((a,s)=>a+s.periodTotal,0), target = stats.reduce((a,s)=>a+s.target,0);
+    const pc = paceInfo(bk, achieved, target);
+    return {bk, achieved, target, pct:pctOf(achieved, target), pc};
+  });
+}
 function renderAnalytics(){
   setTitle('Analytics');
   const view = document.getElementById('view');
-  const keys = anState.biz==='all' ? BUSINESSES.map(b=>b.key) : [anState.biz];
-  const trend = monthlyTrend(keys, 12);
-  const rank = rankSalesmen(keys, anState.scope).slice(0, 15);
-  const prods = rankProducts(keys).slice(0, 10);
+  const keys = anKeys(), df = anState.from, dt = anState.to, multi = anState.biz==='all';
+  const trend = monthlyTrend(keys, 12, df, dt);
+  const rank = rankSalesmen(keys, anState.scope, df, dt).slice(0, 15);
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort);
   const paceCards = keys.map(paceCardHtml).join('');
   const sumTotal = trend.reduce((a,t)=>a+t.total,0), sumPromo = trend.reduce((a,t)=>a+t.promo,0);
+  const topAmt = Math.max(1, ...sold.map(r=>anState.sort==='qty' ? r.qty : r.amount));
+  const totQty = sold.reduce((a,r)=>a+r.qty,0), totAmt = sold.reduce((a,r)=>a+r.amount,0);
   view.innerHTML = `
-    <div class="chip-list" style="margin-bottom:14px; max-height:none;">
+    <div class="chip-list" style="margin-bottom:12px; max-height:none;">
       <span class="chip ${anState.biz==='all'?'checked':''}" data-an-biz="all" style="cursor:pointer;">All businesses</span>
       ${BUSINESSES.map(b=>`<span class="chip ${b.key===anState.biz?'checked':''}" data-an-biz="${b.key}" style="cursor:pointer;">${esc(bizName(b.key))}</span>`).join('')}
     </div>
-    <div class="section-head"><h2>🎯 Target pace</h2></div>
-    <p class="text-soft" style="font-size:13px; margin:-4px 0 12px;">Based on each business's session period (Settings). “Projected” assumes the sales speed so far continues until the period ends.</p>
+    <div class="toolbar" style="margin-bottom:6px;">
+      <label class="text-soft" style="font-size:13px;">From <input type="date" id="anFrom" value="${esc(anState.from)}"/></label>
+      <label class="text-soft" style="font-size:13px;">To <input type="date" id="anTo" value="${esc(anState.to)}"/></label>
+      <button class="btn btn-sm btn-ghost" id="anClear" type="button" ${(df||dt)?'':'disabled'}>Clear dates</button>
+      <span class="spacer"></span>
+      <button class="btn" id="btnAnExcel" type="button">⇩ Excel (all sections)</button>
+    </div>
+    <p class="text-soft" style="font-size:12.5px; margin:0 0 16px;">Date range applies to the month-wise trend, salesman ranking (All memos) and product-wise sales. Target pace always follows each business's session period.</p>
+
+    <div class="section-head"><h2>🎯 Target pace</h2><button class="btn btn-primary" id="btnPrintOverview" type="button" title="Prints Target pace, Month-wise trend and Salesman ranking together">🖨 Print / PDF — Pace, Trend &amp; Ranking</button></div>
+    <p class="text-soft" style="font-size:13px; margin:-4px 0 12px;">“Projected” assumes the sales speed so far continues until the period ends.</p>
     <div class="grid grid-2" style="margin-bottom:22px;">${paceCards}</div>
 
     <div class="card" style="margin-bottom:18px;">
@@ -5173,23 +5438,99 @@ function renderAnalytics(){
       ${trend.length ? `
         <div class="chart-legend"><span><i style="background:var(--accent)"></i>Total sales</span><span><i style="background:var(--brass)"></i>Promotional sales</span></div>
         ${svgColumns(trend.map(t=>({label:t.label, v:[t.total, t.promo]})), ['var(--accent)','var(--brass)'], ['Total sales','Promotional sales'], 'Month-wise sales trend')}
-        <div class="text-soft" style="font-size:12.5px; margin-top:8px;">Shown period total: <b>${fmtMoney(sumTotal)}</b> sales · <b>${fmtMoney(sumPromo)}</b> promotional · ${trend.reduce((a,t)=>a+t.count,0)} memos. All memos are counted, from both Promotional Sales and Sales Target.</div>`
-      : emptyState('📈','No memos yet','Record some sales and the monthly trend appears here.')}
+        <div class="text-soft" style="font-size:12.5px; margin-top:8px;">Total: <b>${fmtMoney(sumTotal)}</b> sales · <b>${fmtMoney(sumPromo)}</b> promotional · ${trend.reduce((a,t)=>a+t.count,0)} memos. All memos are counted, from both Promotional Sales and Sales Target.</div>`
+      : emptyState('📈','No memos in this range','Record some sales and the monthly trend appears here.')}
     </div>
 
-    <div class="grid grid-2">
-      <div class="card">
-        <div class="section-head"><h2>🏆 Salesman ranking</h2>
-          <span><button class="btn btn-sm ${anState.scope==='period'?'btn-primary':'btn-ghost'}" data-an-scope="period" type="button">Target period</button> <button class="btn btn-sm ${anState.scope==='all'?'btn-primary':'btn-ghost'}" data-an-scope="all" type="button">All time</button></span></div>
-        ${rank.length ? hBars(rank.map(r=>({label:r.name, sub:anState.biz==='all'?bizName(r.biz):'', value:r.value, cls: anState.scope==='period' && r.pct>=100 ? 'ok' : '', text: fmtMoney(r.value)+(anState.scope==='period' ? ' · '+r.pct+'%' : '')}))) : emptyState('🏆','Nothing to rank yet','Accounts with sales appear here.')}
-      </div>
-      <div class="card">
-        <div class="section-head"><h2>📦 Product-wise sales</h2><span class="badge-count">top ${prods.length} by quantity</span></div>
-        ${prods.length ? hBars(prods.map(p=>({label:p.name, sub:(anState.biz==='all'?bizName(p.biz)+' · ':'')+p.model, value:p.qty, text:p.qty.toLocaleString()+' pcs'+(p.value?' · '+fmtMoney(p.value):'')}))) : emptyState('📦','No product sales yet','Quantities sold appear here once memos include products.')}
-      </div>
+    <div class="card" style="margin-bottom:18px;">
+      <div class="section-head"><h2>🏆 Salesman ranking</h2>
+        <span><button class="btn btn-sm ${anState.scope==='period'?'btn-primary':'btn-ghost'}" data-an-scope="period" type="button">Target period</button> <button class="btn btn-sm ${anState.scope==='range'?'btn-primary':'btn-ghost'}" data-an-scope="range" type="button">All memos</button></span></div>
+      ${rank.length ? hBars(rank.map(r=>({label:r.name, sub:multi?bizName(r.biz):'', value:r.value, cls: anState.scope==='period' && r.pct>=100 ? 'ok' : '', text: fmtMoney(r.value)+(anState.scope==='period' ? ' · '+r.pct+'%' : '')}))) : emptyState('🏆','Nothing to rank yet','Accounts with sales appear here.')}
+    </div>
+
+    <div class="card" style="margin-bottom:18px;">
+      <div class="section-head"><h2>📦 Product-wise sales</h2>
+        <span><button class="btn btn-sm ${anState.sort==='amount'?'btn-primary':'btn-ghost'}" data-an-sort="amount" type="button">By amount</button> <button class="btn btn-sm ${anState.sort==='qty'?'btn-primary':'btn-ghost'}" data-an-sort="qty" type="button">By quantity</button> <button class="btn btn-sm btn-primary" id="btnPrintSold" type="button">🖨 Print / PDF</button></span></div>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${sold.length} product(s) sold · ${totQty.toLocaleString()} pcs · <b>${fmtMoney(totAmt)}</b> total. Highest first. Total amount = quantity sold × price in Product Details.</p>
+      ${sold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th><th>Model No.</th>${multi?'<th>Business</th>':''}<th class="right">Qty sold</th><th class="right">Price</th><th class="right">Total amount</th><th style="min-width:120px;"></th></tr></thead><tbody>
+        ${sold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}${r.inMaster?'':' <span class="pill pill-warn" title="Not found in Product Details, so its amount cannot be calculated">not in list</span>'}</td><td class="mono">${esc(r.model)}</td>${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.qty.toLocaleString()}</td><td class="right mono">${r.inMaster?fmtMoney(r.price):'—'}</td><td class="right mono"><b>${fmtMoney(r.amount)}</b></td>
+          <td><div class="hbar-track"><div class="hbar-fill" style="width:${Math.max(1.5,(anState.sort==='qty'?r.qty:r.amount)/topAmt*100).toFixed(1)}%"></div></div></td></tr>`).join('')}
+        <tr style="font-weight:700; background:var(--paper);"><td></td><td>Total</td><td></td>${multi?'<td></td>':''}<td class="right mono">${totQty.toLocaleString()}</td><td></td><td class="right mono">${fmtMoney(totAmt)}</td><td></td></tr>
+        </tbody></table></div>` : emptyState('📦','No product sales in this range','Quantities sold appear here once memos include products.')}
+    </div>
+
+    <div class="card">
+      <div class="section-head"><h2>🕸️ Products not sold</h2><span><span class="badge-count">${unsold.length} product(s)</span> <button class="btn btn-sm btn-primary" id="btnPrintUnsold" type="button">🖨 Print / PDF</button></span></div>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">In Product Details but with no sales ${(df||dt)?'in this date range':'yet'}.</p>
+      ${unsold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th><th>Model No.</th>${multi?'<th>Business</th>':''}<th class="right">In stock</th><th class="right">Price</th></tr></thead><tbody>
+        ${unsold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td><td class="mono">${esc(r.model)}</td>${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.stock}</td><td class="right mono">${fmtMoney(r.price)}</td></tr>`).join('')}
+        </tbody></table></div>` : emptyState('✅','Every product has sold','All products in Product Details have at least one sale.')}
     </div>`;
   view.querySelectorAll('[data-an-biz]').forEach(el=>el.onclick = ()=>{ anState.biz = el.dataset.anBiz; renderAnalytics(); });
   view.querySelectorAll('[data-an-scope]').forEach(el=>el.onclick = ()=>{ anState.scope = el.dataset.anScope; renderAnalytics(); });
+  view.querySelectorAll('[data-an-sort]').forEach(el=>el.onclick = ()=>{ anState.sort = el.dataset.anSort; renderAnalytics(); });
+  document.getElementById('anFrom').onchange = e=>{ anState.from = e.target.value; renderAnalytics(); };
+  document.getElementById('anTo').onchange = e=>{ anState.to = e.target.value; renderAnalytics(); };
+  document.getElementById('anClear').onclick = ()=>{ anState.from = ''; anState.to = ''; renderAnalytics(); };
+  const scopeName = multi ? 'All businesses' : bizName(anState.biz);
+  document.getElementById('btnPrintOverview').onclick = ()=>openPrintPreview('Target Pace, Month-wise Trend & Salesman Ranking — '+scopeName+' ('+anRangeLabel()+')', analyticsOverviewPrintHtml(), 'promaxis_pace_trend_ranking_'+todayStr());
+  document.getElementById('btnPrintSold').onclick = ()=>openPrintPreview('Product-wise Sales — '+scopeName+' ('+anRangeLabel()+')', analyticsSoldPrintHtml(), 'promaxis_product_wise_sales_'+todayStr());
+  document.getElementById('btnPrintUnsold').onclick = ()=>openPrintPreview('Products Not Sold — '+scopeName+' ('+anRangeLabel()+')', analyticsUnsoldPrintHtml(), 'promaxis_products_not_sold_'+todayStr());
+  document.getElementById('btnAnExcel').onclick = analyticsExcel;
+}
+function analyticsTables(){
+  const keys = anKeys(), df = anState.from, dt = anState.to, multi = anState.biz==='all';
+  const pace = paceRows(keys).map(r=>[bizName(r.bk), targetPeriodLabel(r.bk), fmtMoney(r.achieved), fmtMoney(r.target), r.pct+'%',
+    r.pc.state==='running' ? fmtMoney(r.pc.projected)+' ('+r.pc.projPct+'%)' : paceLabel(r.pc), r.pc.left!=null ? r.pc.left : '', r.pc.state==='running' && r.pc.left>0 ? fmtMoney(r.pc.perDay) : '']);
+  const trend = monthlyTrend(keys, 12, df, dt);
+  const rank = rankSalesmen(keys, anState.scope, df, dt);
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort);
+  return {keys, multi, trend, rank, sold, unsold, pace,
+    paceHead:['Business','Target period','Achieved','Target','Achieve %','Projected at period end','Days left','Needed per day'],
+    trendHead:['Month','Total sales','Promotional sales','Memos'], trendRows:trend.map(t=>[t.label, fmtMoney(t.total), fmtMoney(t.promo), t.count]),
+    rankHead:['#','Salesman'].concat(multi?['Business']:[]).concat(['Amount'], anState.scope==='period'?['Achieve %']:[]),
+    rankRows:rank.map((r,i)=>[i+1, r.name].concat(multi?[bizName(r.biz)]:[]).concat([fmtMoney(r.value)], anState.scope==='period'?[r.pct+'%']:[])),
+    soldHead:['#','Product','Model No.'].concat(multi?['Business']:[]).concat(['Qty sold','Price','Total amount']),
+    soldRows:sold.map((r,i)=>[i+1, r.name, r.model].concat(multi?[bizName(r.biz)]:[]).concat([r.qty, r.inMaster?fmtMoney(r.price):'—', fmtMoney(r.amount)])),
+    unsoldHead:['#','Product','Model No.'].concat(multi?['Business']:[]).concat(['In stock','Price']),
+    unsoldRows:unsold.map((r,i)=>[i+1, r.name, r.model].concat(multi?[bizName(r.biz)]:[]).concat([r.stock, fmtMoney(r.price)]))};
+}
+function analyticsScopeLine(t, withRange){
+  return `<div style="font-size:13px; margin-bottom:8px;"><b>Scope:</b> ${esc(t.multi?'All businesses':bizName(anState.biz))} &nbsp; ${withRange?`<b>Date range:</b> ${esc(anRangeLabel())} &nbsp; `:''}<b>Printed:</b> ${esc(new Date().toLocaleString())}</div>`;
+}
+/* one print for Target pace + Month-wise trend + Salesman ranking */
+function analyticsOverviewPrintHtml(){
+  const t = analyticsTables();
+  const chart = t.trend.length ? svgColumns(t.trend.map(x=>({label:x.label, v:[x.total, x.promo]})), ['#0FB5A6','#C99B3F'], ['Total sales','Promotional sales'], 'Month-wise sales trend').replace(/var\(--line\)/g,'#E3E6F0').replace(/var\(--ink-soft\)/g,'#4B5563') : '';
+  return analyticsScopeLine(t, true)
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">Target pace follows each business's session period; the date range applies to the trend and to the ranking when it is set to “All memos”.</div>
+    <h3>Target pace</h3>${tableHtml(t.paceHead, t.pace)}
+    <h3>Month-wise trend</h3>${chart ? `<div style="max-width:720px;">${chart}</div>` : ''}${tableHtml(t.trendHead, t.trendRows)}
+    <h3>Salesman ranking (${anState.scope==='period'?'target period':'all memos'})</h3>${tableHtml(t.rankHead, t.rankRows.slice(0,40))}`;
+}
+function analyticsSoldPrintHtml(){
+  const t = analyticsTables(), totAmt = t.sold.reduce((a,r)=>a+r.amount,0), totQty = t.sold.reduce((a,r)=>a+r.qty,0);
+  const rows = t.soldRows.concat(t.sold.length ? [['Total','',''].concat(t.multi?['']:[]).concat([totQty, '', fmtMoney(totAmt)])] : []);
+  return analyticsScopeLine(t, true)
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.sold.length} product(s) sold, highest ${anState.sort==='qty'?'quantity':'amount'} first. Total amount = quantity sold × price in Product Details.</div>`
+    + tableHtml(t.soldHead, rows);
+}
+function analyticsUnsoldPrintHtml(){
+  const t = analyticsTables();
+  return analyticsScopeLine(t, true)
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.unsold.length} product(s) in Product Details with no sales ${(anState.from||anState.to)?'in this date range':'yet'}.</div>`
+    + tableHtml(t.unsoldHead, t.unsoldRows);
+}
+function analyticsExcel(){
+  const t = analyticsTables();
+  if(typeof XLSX==='undefined'){ csvDownload(t.soldHead, t.soldRows, 'promaxis_product_wise_sales_'+todayStr()); toast('Excel library is not loaded (no internet) — saved the product-wise list as CSV.'); return; }
+  try{
+    const wb = XLSX.utils.book_new();
+    const add = (name, head, rows)=>XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head, ...(rows.length?rows:[[]])]), name);
+    add('Product-wise sales', t.soldHead, t.soldRows); add('Products not sold', t.unsoldHead, t.unsoldRows);
+    add('Salesman ranking', t.rankHead, t.rankRows); add('Month-wise trend', t.trendHead, t.trendRows); add('Target pace', t.paceHead, t.pace);
+    XLSX.writeFile(wb, 'promaxis_analytics_'+todayStr()+'.xlsx'); toast('Excel file downloaded');
+  }catch(e){ toast('Excel export failed: '+e.message, 'danger'); }
 }
 
 /* ---------- Recycle bin ---------- */
@@ -5301,9 +5642,9 @@ function renderReportContractor(){
 
 /* ---------- WhatsApp messages (Bangla templates) ---------- */
 const WA_DEFAULT = {
-  status:"প্রিয় {name},\n{business} — টার্গেট স্ট্যাটাস ({period})\nটার্গেট: {target}\nঅর্জন: {achieved} ({pct}%)\nবাকি: {remaining}\nধন্যবাদ।",
-  remind:"প্রিয় {name}, {business}-এর টার্গেট পূরণে আর মাত্র {days_left} দিন বাকি। এখনো {remaining} বাকি আছে (অর্জন {pct}%)। টার্গেট পূরণ করতে প্রতিদিন গড়ে {per_day} বিক্রি দরকার। আপনার সর্বোচ্চ চেষ্টা আশা করছি। ধন্যবাদ।",
-  congrats:"অভিনন্দন {name}! 🎉 {business}-এর টার্গেট আপনি পূরণ করেছেন — অর্জন {achieved} ({pct}%)।{incentive_line} ধন্যবাদ।"
+  status:"Dear {name},\n{business} — Target status ({period})\nTarget: {target}\nAchieved: {achieved} ({pct}%)\nRemaining: {remaining}\nThank you.",
+  remind:"Dear {name}, only {days_left} day(s) are left to complete your {business} target. {remaining} is still remaining (achieved {pct}%). To reach the target you need to sell about {per_day} per day. We count on your best effort. Thank you.",
+  congrats:"Congratulations {name}! 🎉 You have achieved your {business} target — {achieved} ({pct}%).{incentive_line} Thank you."
 };
 const WA_VARS = ['name','business','period','target','achieved','pct','remaining','days_left','per_day','projected_pct','incentive','incentive_line','date'];
 function waTemplates(){ return Object.assign({}, WA_DEFAULT, Store.get('wa_tpl', {})); }
@@ -5331,7 +5672,7 @@ function waVars(bk, name){
   return {name, business:bizName(bk), period:targetPeriodLabel(bk), target:moneyPlain(st.target), achieved:moneyPlain(st.periodTotal), pct:String(st.pct),
     remaining:moneyPlain(Math.max(0, st.target-st.periodTotal)), days_left:pc.left!=null ? String(pc.left) : '—', per_day:pc.perDay!=null ? moneyPlain(pc.perDay) : '—',
     projected_pct:pc.projPct!=null ? String(pc.projPct) : '—', incentive:inc && inc.slab ? moneyExact(inc.amount) : '',
-    incentive_line:inc && inc.slab ? ' আপনার ইনসেন্টিভ: '+moneyExact(inc.amount)+'।' : '', date:fmtDateNice(todayStr())};
+    incentive_line:inc && inc.slab ? ' Your incentive: '+moneyExact(inc.amount)+'.' : '', date:fmtDateNice(todayStr())};
 }
 function waFill(tpl, vars){ return String(tpl).replace(/\{(\w+)\}/g, (m,k)=>vars[k]!==undefined ? vars[k] : m); }
 function waAutoKey(bk, name){
@@ -5418,7 +5759,7 @@ function openPhoneModal(bk, name, onDone){
 function dashExtrasHtml(){
   const low = lowStockList(), trend = monthlyTrend(BUSINESSES.map(b=>b.key), 6);
   let html = '';
-  if(low.length){
+  if(low.length && stockCfg().alerts){
     html += `<div class="section-head" style="margin-top:26px;"><h2>⚠️ Low stock</h2><span class="badge-count">${low.length} product(s)</span></div>
       <div class="card"><div class="table-wrap"><table class="data-table"><thead><tr><th>Business</th><th>Product</th><th>Model</th><th class="right">In stock</th><th class="right">Alert level</th><th></th></tr></thead><tbody>
       ${low.slice(0,8).map(r=>`<tr><td>${esc(bizName(r.biz))}</td><td>${esc(r.p.productName)}</td><td class="mono">${esc(r.p.modelNumber)}</td><td class="right mono" style="color:var(--coral); font-weight:700;">${Number(r.p.quantity)||0}</td><td class="right mono">${lowLevel(r.p)}</td><td><button class="btn btn-sm btn-ghost" data-href2="products/${r.biz}" type="button">Open</button></td></tr>`).join('')}
@@ -5441,6 +5782,7 @@ function settingsExtraHtml(){
     <div class="card">
       <div class="section-head"><h2>📦 Stock</h2></div>
       <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-bottom:10px;"><input type="checkbox" id="stAuto" ${sc.auto?'checked':''}/> Deduct stock automatically when a memo is saved (edits and deletes adjust it back)</label>
+      <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-bottom:10px;"><input type="checkbox" id="stAlerts" ${sc.alerts?'checked':''}/> Show low-stock alerts (Dashboard list and the warning after saving a memo)</label>
       <div class="field" style="max-width:260px;"><label>Default low-stock alert level (qty)</label><input type="number" id="stLow" min="0" step="1" value="${sc.low}"/></div>
       <p class="text-soft" style="font-size:12.5px;">Matching uses the Model No. of each memo line. Clearing a whole account or importing from Excel never changes stock. A product can have its own alert level in Product Details.</p>
       <button class="btn btn-primary" id="btnSaveStock" type="button">Save Stock Settings</button>
@@ -5461,8 +5803,8 @@ function settingsExtraHtml(){
       <p class="text-soft" style="font-size:12.5px; margin-top:10px;"><b>The highest slab reached applies</b> (they don't add up). The numbers shown first (80% → 0.5%, 100% → 1%, 120% → 1.5%) are only samples — enter your real rates, then turn it on.</p>
     </div>
     <div class="card">
-      <div class="section-head"><h2>📲 WhatsApp message templates</h2></div>
-      <p class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Bangla templates sent to salesmen. Available fields: ${WA_VARS.map(v=>`<span class="kbd">{${v}}</span>`).join(' ')}</p>
+      <div class="section-head"><h2>📲 WhatsApp message templates (English)</h2></div>
+      <p class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Templates for the messages sent to salesmen. Available fields: ${WA_VARS.map(v=>`<span class="kbd">{${v}}</span>`).join(' ')}</p>
       ${Object.keys(WA_KEY_LABEL).map(k=>`<div class="field"><label>${WA_KEY_LABEL[k]}</label><textarea data-wa-tpl="${k}" rows="4" style="width:100%; font-family:inherit;">${esc(tp[k])}</textarea></div>`).join('')}
       <button class="btn btn-primary" id="btnSaveWa" type="button">Save Templates</button> <button class="btn btn-ghost" id="btnResetWa" type="button">Restore default wording</button>
     </div>`;
@@ -5470,7 +5812,7 @@ function settingsExtraHtml(){
 function wireSettingsExtra(){
   const v = document.getElementById('view');
   document.getElementById('btnSaveStock').onclick = ()=>{
-    Store.set('stock_cfg', {auto:document.getElementById('stAuto').checked, low:Math.max(0, Number(document.getElementById('stLow').value)||0)});
+    Store.set('stock_cfg', {auto:document.getElementById('stAuto').checked, alerts:document.getElementById('stAlerts').checked, low:Math.max(0, Number(document.getElementById('stLow').value)||0)});
     toast('Stock settings saved'); renderSettings();
   };
   const readSlabs = ()=>Array.from(v.querySelectorAll('#slabRows .slab-row')).map((row,i)=>({
