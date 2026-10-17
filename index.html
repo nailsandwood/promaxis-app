@@ -667,7 +667,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.7.3";
+const APP_VERSION = "4.7.9";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -2394,7 +2394,7 @@ function renderSalesAccountsList(bizKey, mode){
       <span class="spacer"></span>
       <button class="btn" id="btnManageAccounts" type="button">👤 Manage Salesman Accounts</button>
       <button class="btn btn-accent" id="btnFullSummary" type="button">All Accounts Summary</button>
-      ${isTarget ? '<button class="btn" id="btnWaBulk" type="button">📲 WhatsApp Reminders</button>' : ''}
+      <button class="btn" id="btnWaBulk" type="button">${isTarget ? '📲 WhatsApp Reminders' : '📲 WhatsApp Messages'}</button>
     </div>
 
     <div class="grid grid-4" id="acctGrid"></div>
@@ -2488,7 +2488,7 @@ function renderSalesAccountsList(bizKey, mode){
 
   document.getElementById('btnManageAccounts').onclick = ()=>{ accountsViewBiz = bizKey; location.hash = 'accounts'; };
   document.getElementById('btnFullSummary').onclick = ()=>{ readLF(); openAllAccountsSummary(bizKey, mode, isFilterActive(lf) ? Object.assign({}, lf) : null); };
-  const waBulkBtn = document.getElementById('btnWaBulk'); if(waBulkBtn) waBulkBtn.onclick = ()=>openWhatsAppBulk(bizKey);
+  const waBulkBtn = document.getElementById('btnWaBulk'); if(waBulkBtn) waBulkBtn.onclick = ()=>{ readLF(); openWhatsAppBulk(bizKey, mode, !isTarget && isFilterActive(lf) ? Object.assign({}, lf) : null); };
 }
 
 function openTargetModal(bizKey, name, onSaved){
@@ -2621,7 +2621,7 @@ function renderSalesAccountView(bizKey, name, mode){
       <button class="btn btn-accent" id="btnDup" type="button">⚠ Find Duplicate Memo</button>
       <button class="btn" id="btnAcctSummary" type="button">Summary</button>
       <button class="btn" id="btnTransfer" type="button">⇄ Transfer Entries</button>
-      ${isTarget ? '<button class="btn" id="btnWa" type="button">📲 WhatsApp</button>' : ''}
+      <button class="btn" id="btnWa" type="button">📲 WhatsApp</button>
       <div class="search-box"><span class="ic">🔎</span><input id="searchInput" type="text" name="pmx_search" autocomplete="off" spellcheck="false" placeholder="Search memo, product…" value="${esc(avs.search)}"/></div>
       <button class="btn" id="btnFilter" type="button">▾ Filter</button>
       <span class="spacer"></span>
@@ -2796,7 +2796,12 @@ function renderSalesAccountView(bizKey, name, mode){
       undoToast('Account data cleared', _lastTrashId); renderSalesAccountView(bizKey, name, mode);
     });
   };
-  const waBtn = document.getElementById('btnWa'); if(waBtn) waBtn.onclick = ()=>openWhatsAppModal(bizKey, name);
+  const waBtn = document.getElementById('btnWa'); if(waBtn) waBtn.onclick = ()=>{
+    /* Promotional Sales messages follow the account's Filter (dates, memo range, product…), not the search box. */
+    let wf = null;
+    if(!isTarget){ syncFiltersFromPanel(); wf = Object.assign({}, avs, {search:''}); if(!isFilterActive(wf)) wf = null; }
+    openWhatsAppModal(bizKey, name, mode, wf);
+  };
   document.getElementById('btnFilter').onclick = ()=>{ avs.filterOpen=!avs.filterOpen; document.getElementById('filterPanel').classList.toggle('open', avs.filterOpen); };
   function readFilterFields(){
     avs.dateFrom = document.getElementById('fDateFrom').value;
@@ -4661,7 +4666,7 @@ function renderSettings(){
         <details style="margin-top:8px;"><summary style="cursor:pointer; font-weight:600; font-size:13px;">What's new in v4.6.x</summary><ul class="text-soft" style="font-size:12.5px; line-height:1.7; padding-left:18px; margin:6px 0 0;">
           <li>Fixes: local-date default for memos, hashed password + separate recovery key, target % can exceed 100, contractor promo now counted &amp; reported</li>
           <li>Multi-PC sync (Google Drive), automatic daily snapshots, offline app (PWA)</li>
-          <li>Analytics: monthly trend, salesman ranking, product-wise sales, target pace</li>
+          <li>Analytics: monthly trend, salesman ranking, product-wise sales, target pace — with Sales Target and Promotional Sales kept apart</li>
           <li>Memo total auto-calc, stock auto-minus + low-stock alerts</li>
           <li>Recycle Bin with Undo, Audit Log</li>
           <li>Bangla WhatsApp messages, incentive slabs</li></ul></details>
@@ -5452,10 +5457,11 @@ function hBars(rows){
 function monthKeyOf(d){ return /^\d{4}-\d{2}/.test(d||'') ? d.slice(0,7) : null; }
 function monthLabel(m){ return new Date(+m.slice(0,4), +m.slice(5,7)-1, 1).toLocaleDateString('en-GB', {month:'short', year:'2-digit'}); }
 function inRangeE(e, df, dt){ return inDateRange(e, df||'', dt||''); }
-function monthlyTrend(keys, maxMonths, df, dt){
+function monthlyTrend(keys, maxMonths, df, dt, mode){
   const agg = {};
   keys.forEach(bk=>getSales(bk).forEach(e=>{
     if(!inRangeE(e, df, dt)) return;
+    if(mode && !anEntryCounts(bk, e, mode)) return;
     const m = monthKeyOf(e.date); if(!m) return;
     const a = agg[m] || (agg[m] = {total:0, promo:0, count:0});
     a.total += Number(e.total)||0; a.promo += entryPromoAmount(bk, e); a.count++;
@@ -5472,14 +5478,25 @@ function monthlyTrend(keys, maxMonths, df, dt){
   }
   return out;
 }
-function rankSalesmen(keys, scope, df, dt){
+function rankSalesmen(keys, scope, df, dt, mode){
   const rows = [];
+  const hasDates = !!(df || dt);
   keys.forEach(bk=>{
     if(scope==='period'){
-      allAccountStats(bk).forEach(s=>{ if(s.periodTotal>0) rows.push({biz:bk, name:s.name, value:s.periodTotal, pct:s.pct, target:s.target}); });
+      /* Target/Session period: memos that count for this mode inside the session.
+         Date filter (when set) further narrows the window so ranking responds to From/To. */
+      const per = {};
+      getSales(bk).forEach(e=>{
+        if(!anEntryCounts(bk, e, mode)) return;
+        if(mode==='promo' && !anInSession(bk, e)) return;
+        if(hasDates && !inRangeE(e, df, dt)) return;
+        per[e.salesman] = (per[e.salesman]||0) + (Number(e.total)||0);
+      });
+      getSalesmen(bk).forEach(n=>{ const v = per[n]||0; if(v>0){ const t = getTarget(bk, n); rows.push({biz:bk, name:n, value:v, pct:pctOf(v, t), target:t}); } });
     } else {
+      /* All memos: date filter + mode rule */
       const agg = {};
-      getSales(bk).forEach(e=>{ if(inRangeE(e, df, dt)) agg[e.salesman] = (agg[e.salesman]||0) + (Number(e.total)||0); });
+      getSales(bk).forEach(e=>{ if(inRangeE(e, df, dt) && anEntryCounts(bk, e, mode)) agg[e.salesman] = (agg[e.salesman]||0) + (Number(e.total)||0); });
       Object.keys(agg).forEach(n=>{ if(agg[n]>0) rows.push({biz:bk, name:n, value:agg[n], pct:0, target:0}); });
     }
   });
@@ -5506,7 +5523,12 @@ function memoLineAmounts(prods, e){
   if(sw<=0){ w = lines.map(it=>Number(it.qty)||0); sw = w.reduce((a,x)=>a+x, 0); }
   return lines.map((it,i)=>({it, amount: sw>0 ? total*w[i]/sw : 0}));
 }
-function rankProducts(keys, df, dt, sortBy, group){
+/* Name order: product name, then model, then business — numbers inside names sort naturally (2 before 10). */
+function prodNameCmp(a, b){
+  const o = {numeric:true, sensitivity:'base'};
+  return String(a.name||'').localeCompare(String(b.name||''), undefined, o) || String(a.model||'').localeCompare(String(b.model||''), undefined, o) || bizName(a.biz).localeCompare(bizName(b.biz));
+}
+function rankProducts(keys, df, dt, sortBy, group, soldDir, unsoldDir, mode){
   const byModel = group==='model';
   const map = new Map(), soldNames = new Set(), soldNoModel = new Set(), soldModels = new Set();
   keys.forEach(bk=>{
@@ -5514,6 +5536,7 @@ function rankProducts(keys, df, dt, sortBy, group){
     prods.forEach(p=>{ const k = normName(p.productName); if(k && !master.has(k)) master.set(k, String(p.productName).trim()); });
     getSales(bk).forEach(e=>{
       if(!inRangeE(e, df, dt)) return;
+      if(mode && !anEntryCounts(bk, e, mode)) return;
       memoLineAmounts(prods, e).forEach(({it, amount})=>{
         const nm = normName(it.productName) || normName(it.modelNumber) || '(UNNAMED)', model = String(it.modelNumber||'').trim();
         const k = bk+'|'+nm+(byModel ? '|'+model : '');
@@ -5527,7 +5550,8 @@ function rankProducts(keys, df, dt, sortBy, group){
     });
   });
   const sold = Array.from(map.values()).map(r=>{ delete r.ids; return r; })
-    .sort(sortBy==='qty' ? (a,b)=>b.qty-a.qty || b.amount-a.amount : (a,b)=>b.amount-a.amount || b.qty-a.qty);
+    .sort(sortBy==='name' ? (a,b)=>(soldDir==='desc'?-1:1)*prodNameCmp(a,b)
+        : sortBy==='qty' ? (a,b)=>b.qty-a.qty || b.amount-a.amount : (a,b)=>b.amount-a.amount || b.qty-a.qty);
   const unsold = [];
   keys.forEach(bk=>{
     if(!byModel){
@@ -5542,7 +5566,7 @@ function rankProducts(keys, df, dt, sortBy, group){
       });
     }
   });
-  unsold.sort((a,b)=>a.name.localeCompare(b.name) || String(a.model||'').localeCompare(String(b.model||'')));
+  unsold.sort((a,b)=>(unsoldDir==='desc'?-1:1)*prodNameCmp(a,b));
   return {sold, unsold};
 }
 function paceStatus(pc, pct){
@@ -5550,15 +5574,65 @@ function paceStatus(pc, pct){
   if(pc.state==='ended') return pct>=100 ? {t:'Target achieved', c:'pill-ok'} : {t:'Period ended', c:'pill-warn'};
   return {t:paceLabel(pc), c:'pill-info'};
 }
-function paceCardHtml(bk){
-  const stats = allAccountStats(bk);
-  const achieved = stats.reduce((a,s)=>a+s.periodTotal,0), target = stats.reduce((a,s)=>a+s.target,0);
+/* v4.7.7 — Analytics side rules (aligned with Reports / Summary / account views):
+   Promotional Sales (yellow): only promo-side memos (source !== 'target'). No targets / %.
+   Sales Target (green): uses inTargetPeriod — when a Session Period is set, EVERY memo
+   (either side) dated inside it counts toward Sales Target; when no period is set, only
+   memos entered on the Sales Target side (source === 'target') count. Same rule as the rest of the app. */
+function anSideOk(e, mode){ return mode==='promo' ? e.source!=='target' : e.source==='target'; }
+function anSideEntries(bk, mode){ return getSales(bk).filter(e=>anSideOk(e, mode)); }
+/* Does this memo count for Analytics under the given mode? */
+function anEntryCounts(bk, e, mode){
+  if(mode==='promo') return e.source!=='target';
+  return inTargetPeriod(bk, e); /* Sales Target — same rule as Reports/Summary */
+}
+/* inside the business's Session Period (when none is set, every memo of that side counts) */
+function anInSession(bk, e){
+  const p = getSessionPeriod(bk); if(!p.from) return true;
+  if(e.date < p.from) return false; if(p.to && e.date > p.to) return false; return true;
+}
+/* Pace figures for Sales Target: achieved = all memos that count via inTargetPeriod,
+   target = sum of salesman targets. (Promo mode no longer uses pace-against-target.) */
+function paceFigures(bk, mode){
+  const names = getSalesmen(bk), set = new Set(names);
+  let achieved = 0, count = 0;
+  getSales(bk).forEach(e=>{
+    if(!set.has(e.salesman) || !anEntryCounts(bk, e, mode)) return;
+    achieved += Number(e.total)||0; count++;
+  });
+  return {achieved, target:names.reduce((a,n)=>a+getTarget(bk,n),0), count};
+}
+/* Promo-only summary (no target / % / projected / days-left) — uses Analytics date filter when set, else all promo memos */
+function promoSummaryFigures(bk, df, dt){
+  let achieved = 0, count = 0;
+  anSideEntries(bk, 'promo').forEach(e=>{
+    if(!inRangeE(e, df, dt)) return;
+    achieved += Number(e.total)||0; count++;
+  });
+  return {achieved, count};
+}
+function promoSummaryCardHtml(bk, df, dt){
+  const fg = promoSummaryFigures(bk, df, dt);
+  if(fg.achieved<=0 && fg.count<=0) return '';
+  const rangeTxt = (df||dt) ? `${df?fmtDateNice(df):'start'} – ${dt?fmtDateNice(dt):'today'}` : 'All dates';
+  return `<div class="card pace-card">
+    <div class="section-head"><h3 style="display:flex; align-items:center; gap:10px;">${bizLogoHtml(bk, 26)} ${esc(bizName(bk))}</h3></div>
+    <div class="pace-legend text-soft"><b>Promotional Sales</b> · ${fg.count} memo(s)<br>Date range: ${esc(rangeTxt)}</div>
+    <div class="grid grid-2 pace-stats" style="margin-top:10px;">
+      <div><div class="eyebrow">Promotional Sales</div><div class="pace-num">${fmtMoney(fg.achieved)}</div><div class="text-soft">${fg.count} memo(s)</div></div>
+      <div><div class="eyebrow">Average per memo</div><div class="pace-num">${fg.count ? fmtMoney(Math.round(fg.achieved/fg.count)) : '—'}</div><div class="text-soft">from promo side only</div></div>
+    </div>
+  </div>`;
+}
+function paceCardHtml(bk, mode){
+  /* Target mode only — full pace against salesman targets */
+  const fg = paceFigures(bk, mode), achieved = fg.achieved, target = fg.target;
   const pct = pctOf(achieved, target), pc = paceInfo(bk, achieved, target), st = paceStatus(pc, pct);
   const running = pc.state==='running' || pc.state==='ended';
   return `<div class="card pace-card">
     <div class="section-head"><h3 style="display:flex; align-items:center; gap:10px;">${bizLogoHtml(bk, 26)} ${esc(bizName(bk))}</h3><span class="pill ${st.c}">${esc(st.t)}</span></div>
     <div class="pace-bar" title="Achieved ${pct}%"><div class="pace-fill ${pct>=100?'ok':''}" style="width:${ringPct(pct)}%"></div>${running ? `<span class="pace-mark" style="left:${Math.min(100,pc.expectedPct)}%" title="Where you should be today: ${pc.expectedPct}%"></span>` : ''}</div>
-    <div class="pace-legend text-soft">${running ? `Marker = where you should be today (${pc.expectedPct}% of the period gone)` : esc(paceLabel(pc))} · Period: ${esc(targetPeriodLabel(bk))}</div>
+    <div class="pace-legend text-soft"><b>Sales Target</b> · ${fg.count} memo(s)<br>${running ? `Marker = where you should be today (${pc.expectedPct}% of the period gone)` : esc(paceLabel(pc))} · Period: ${esc(targetPeriodLabel(bk))}</div>
     <div class="grid grid-4 pace-stats">
       <div><div class="eyebrow">Achieved</div><div class="pace-num">${fmtMoney(achieved)}</div><div class="text-soft">${pct}% of ${fmtMoney(target)}</div></div>
       <div><div class="eyebrow">Projected at period end</div><div class="pace-num">${running && pc.state==='running' ? fmtMoney(pc.projected) : '—'}</div><div class="text-soft">${running && pc.state==='running' ? pc.projPct+'% of target' : ''}</div></div>
@@ -5567,29 +5641,45 @@ function paceCardHtml(bk){
     </div>
   </div>`;
 }
-let anState = {biz:'all', scope:'period', from:'', to:'', sort:'amount', group:'name'};
+let anState = {biz:'all', mode:'target', scope:'period', from:'', to:'', sort:'amount', group:'name', soldDir:'asc', unsoldDir:'asc'};
 function anKeys(){ return anState.biz==='all' ? BUSINESSES.map(b=>b.key) : [anState.biz]; }
 function anRangeLabel(){ return (anState.from||anState.to) ? `${anState.from?fmtDateNice(anState.from):'start'} – ${anState.to?fmtDateNice(anState.to):'today'}` : 'All dates'; }
-function paceRows(keys){
+function paceRows(keys, mode){
   return keys.map(bk=>{
-    const stats = allAccountStats(bk), achieved = stats.reduce((a,s)=>a+s.periodTotal,0), target = stats.reduce((a,s)=>a+s.target,0);
+    const fg = paceFigures(bk, mode), achieved = fg.achieved, target = fg.target;
     const pc = paceInfo(bk, achieved, target);
-    return {bk, achieved, target, pct:pctOf(achieved, target), pc};
+    return {bk, achieved, target, pct:pctOf(achieved, target), pc, count:fg.count};
   });
 }
 function renderAnalytics(){
   setTitle('Analytics');
   const view = document.getElementById('view');
   const keys = anKeys(), df = anState.from, dt = anState.to, multi = anState.biz==='all';
-  const trend = monthlyTrend(keys, 12, df, dt);
-  const rank = rankSalesmen(keys, anState.scope, df, dt).slice(0, 15);
-  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group);
+  const trend = monthlyTrend(keys, 12, df, dt, anState.mode);
+  const rank = rankSalesmen(keys, anState.scope, df, dt, anState.mode).slice(0, 15);
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group, anState.soldDir, anState.unsoldDir, anState.mode);
   const byModel = anState.group==='model';
-  const paceCards = keys.map(paceCardHtml).join('');
+  const pm = anState.mode==='promo' ? 'promo' : 'target';
+  /* Target pace: only businesses with achieved > 0 in session period. Promo summary: date-filter based, no targets. */
+  let paceCards = '';
+  if(pm==='target'){
+    const paceKeys = paceRows(keys, 'target').filter(r=>r.achieved>0).map(r=>r.bk);
+    paceCards = paceKeys.length ? paceKeys.map(bk=>paceCardHtml(bk, 'target')).join('') : '';
+  } else {
+    const cards = keys.map(bk=>promoSummaryCardHtml(bk, df, dt)).filter(Boolean);
+    paceCards = cards.length ? cards.join('') : '';
+  }
   const sumTotal = trend.reduce((a,t)=>a+t.total,0), sumPromo = trend.reduce((a,t)=>a+t.promo,0);
   const topAmt = Math.max(1, ...sold.map(r=>anState.sort==='qty' ? r.qty : r.amount));
   const totQty = sold.reduce((a,r)=>a+r.qty,0), totAmt = sold.reduce((a,r)=>a+r.amount,0);
+  /* Promo ranking never shows target % — pure sales amount only */
+  const rankShowPct = pm==='target' && anState.scope==='period';
   view.innerHTML = `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+      <button class="btn ${pm==='target'?'btn-primary':'btn-ghost'}" data-an-mode="target" type="button">🎯 Sales Target</button>
+      <button class="btn ${pm==='promo'?'btn-primary':'btn-ghost'}" data-an-mode="promo" type="button">📈 Promotional Sales</button>
+    </div>
+    <p class="text-soft" style="font-size:12.5px; margin:0 0 14px;">Showing <b>${pm==='promo' ? 'Promotional Sales' : 'Sales Target'}</b> data only — the other side is not mixed in. Switch above to see it.</p>
     <div class="chip-list" style="margin-bottom:12px; max-height:none;">
       <span class="chip ${anState.biz==='all'?'checked':''}" data-an-biz="all" style="cursor:pointer;">All businesses</span>
       ${BUSINESSES.map(b=>`<span class="chip ${b.key===anState.biz?'checked':''}" data-an-biz="${b.key}" style="cursor:pointer;">${esc(bizName(b.key))}</span>`).join('')}
@@ -5601,74 +5691,104 @@ function renderAnalytics(){
       <span class="spacer"></span>
       <button class="btn" id="btnAnExcel" type="button">⇩ Excel (all sections)</button>
     </div>
-    <p class="text-soft" style="font-size:12.5px; margin:0 0 16px;">Date range applies to the month-wise trend, salesman ranking (All memos) and product-wise sales. Target pace always follows each business's session period.</p>
+    <p class="text-soft" style="font-size:12.5px; margin:0 0 16px;">${pm==='promo'
+      ? 'Date range filters the promotional summary, month-wise trend, salesman ranking and product-wise sales. Clear dates to see all. No target periods or percentages are used here.'
+      : 'Date range filters the month-wise trend, salesman ranking and product-wise sales. <b>Target pace always follows each business\'s full session period</b> (not the date filter).'}</p>
 
-    <div class="section-head"><h2>🎯 Target pace</h2><button class="btn btn-primary" id="btnPrintOverview" type="button" title="Prints Target pace, Month-wise trend and Salesman ranking together">🖨 Print / PDF — Pace, Trend &amp; Ranking</button></div>
-    <p class="text-soft" style="font-size:13px; margin:-4px 0 12px;">“Projected” assumes the sales speed so far continues until the period ends.</p>
-    <div class="grid grid-2" style="margin-bottom:22px;">${paceCards}</div>
+    <div class="section-head"><h2>${pm==='promo' ? '📈 Promotional Sales summary' : '🎯 Target pace'}</h2>
+      <button class="btn btn-primary" id="btnPrintOverview" type="button" title="Prints the summary/pace, Month-wise trend and Salesman ranking together">🖨 Print / PDF — ${pm==='promo'?'Summary':'Pace'}, Trend &amp; Ranking</button></div>
+    <p class="text-soft" style="font-size:13px; margin:-4px 0 12px;">${pm==='promo'
+      ? 'Only memos entered on the Promotional Sales side are counted. Totals follow the date filter above (or all dates if cleared). No targets, percentages or projections — pure promotional sales analysis.'
+      : 'Session period set → every memo (either side) dated inside it counts toward Sales Target (same rule as Reports & Summary). No period set → only memos entered on the Sales Target side. Measured against salesman targets. “Projected” assumes the sales speed so far continues until the period ends.'}</p>
+    ${paceCards ? `<div class="grid grid-2" style="margin-bottom:22px;">${paceCards}</div>` : `<div class="card" style="margin-bottom:22px;">${pm==='promo' ? emptyState('📈','No promotional sales',(df||dt) ? 'No promotional sales memos between '+anRangeLabel()+'. Try clearing the date filter or widening the range.' : 'No promotional sales memos yet.') : emptyState('🎯','No sales in the target period','Businesses with no achieved sales (TK 0) in their target period are not listed here.')}</div>`}
 
     <div class="card" style="margin-bottom:18px;">
       <div class="section-head"><h2>📈 Month-wise trend</h2><span class="badge-count">${trend.length ? 'last '+trend.length+' month(s)' : 'no data'}</span></div>
       ${trend.length ? `
         <div class="chart-legend"><span><i style="background:var(--accent)"></i>Total sales</span><span><i style="background:var(--brass)"></i>Promotional sales</span></div>
         ${svgColumns(trend.map(t=>({label:t.label, v:[t.total, t.promo]})), ['var(--accent)','var(--brass)'], ['Total sales','Promotional sales'], 'Month-wise sales trend')}
-        <div class="text-soft" style="font-size:12.5px; margin-top:8px;">Total: <b>${fmtMoney(sumTotal)}</b> sales · <b>${fmtMoney(sumPromo)}</b> promotional · ${trend.reduce((a,t)=>a+t.count,0)} memos. All memos are counted, from both Promotional Sales and Sales Target.</div>`
-      : emptyState('📈','No memos in this range','Record some sales and the monthly trend appears here.')}
+        <div class="text-soft" style="font-size:12.5px; margin-top:8px;">Total: <b>${fmtMoney(sumTotal)}</b> sales · <b>${fmtMoney(sumPromo)}</b> promotional · ${trend.reduce((a,t)=>a+t.count,0)} memos. ${pm==='promo' ? 'Only Promotional Sales memos are counted.' : 'Sales Target counting rule applied.'}</div>`
+      : emptyState('📈','No memos in this range',(df||dt) ? 'No memos between '+anRangeLabel()+'. Clear the date filter (or set e.g. the session period dates) to see the monthly trend.' : 'Record some sales and the monthly trend appears here.')}
     </div>
 
     <div class="card" style="margin-bottom:18px;">
       <div class="section-head"><h2>🏆 Salesman ranking</h2>
-        <span><button class="btn btn-sm ${anState.scope==='period'?'btn-primary':'btn-ghost'}" data-an-scope="period" type="button">Target period</button> <button class="btn btn-sm ${anState.scope==='range'?'btn-primary':'btn-ghost'}" data-an-scope="range" type="button">All memos</button></span></div>
-      ${rank.length ? hBars(rank.map(r=>({label:r.name, sub:multi?bizName(r.biz):'', value:r.value, cls: anState.scope==='period' && r.pct>=100 ? 'ok' : '', text: fmtMoney(r.value)+(anState.scope==='period' ? ' · '+r.pct+'%' : '')}))) : emptyState('🏆','Nothing to rank yet','Accounts with sales appear here.')}
+        <span><button class="btn btn-sm ${anState.scope==='period'?'btn-primary':'btn-ghost'}" data-an-scope="period" type="button">${pm==='promo' ? 'Session period' : 'Target period'}</button> <button class="btn btn-sm ${anState.scope==='range'?'btn-primary':'btn-ghost'}" data-an-scope="range" type="button">All memos</button></span></div>
+      ${(df||dt) ? `<p class="text-soft" style="font-size:12px; margin:0 0 8px;">Date filter active: <b>${esc(anRangeLabel())}</b> — ranking only counts memos inside this range${anState.scope==='period' ? ' ∩ session period' : ''}.</p>` : ''}
+      ${rank.length ? hBars(rank.map(r=>({label:r.name, sub:multi?bizName(r.biz):'', value:r.value, cls: rankShowPct && r.pct>=100 ? 'ok' : '', text: fmtMoney(r.value)+(rankShowPct ? ' · '+r.pct+'%' : '')}))) : emptyState('🏆','Nothing to rank yet',(df||dt) ? 'No sales between '+anRangeLabel()+'. Clear the date filter or widen the range.' : 'Accounts with sales appear here.')}
     </div>
 
     <div class="card" style="margin-bottom:18px;">
       <div class="section-head"><h2>📦 Product-wise sales</h2>
-        <span><button class="btn btn-sm ${anState.sort==='amount'?'btn-primary':'btn-ghost'}" data-an-sort="amount" type="button">By amount</button> <button class="btn btn-sm ${anState.sort==='qty'?'btn-primary':'btn-ghost'}" data-an-sort="qty" type="button">By quantity</button> <button class="btn btn-sm btn-primary" id="btnPrintSold" type="button">🖨 Print / PDF</button></span></div>
+        <span><button class="btn btn-sm ${anState.sort==='amount'?'btn-primary':'btn-ghost'}" data-an-sort="amount" type="button">By amount</button> <button class="btn btn-sm ${anState.sort==='qty'?'btn-primary':'btn-ghost'}" data-an-sort="qty" type="button">By quantity</button> <button class="btn btn-sm ${anState.sort==='name'?'btn-primary':'btn-ghost'}" data-an-sort="name" type="button" title="Sort by product name — click again to reverse">By name ${anState.sort==='name' && anState.soldDir==='desc' ? '(Z–A)' : '(A–Z)'}</button> <button class="btn btn-sm btn-primary" id="btnPrintSold" type="button">🖨 Print / PDF</button></span></div>
       <div style="margin:0 0 8px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;"><span class="text-soft" style="font-size:12.5px;">Group:</span>
         <button class="btn btn-sm ${!byModel?'btn-primary':'btn-ghost'}" data-an-group="name" type="button">By product name</button>
         <button class="btn btn-sm ${byModel?'btn-primary':'btn-ghost'}" data-an-group="model" type="button">By name + model</button></div>
-      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${sold.length} product(s) sold · ${totQty.toLocaleString()} pcs · <b>${fmtMoney(totAmt)}</b> total. Highest first. Products are listed exactly as typed on the memos${byModel?'':' (models are not separated)'}. Total amount = the memo total; when a memo has several products its total is shared between them (by value, or by quantity if prices are not set).</p>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${sold.length} product(s) sold · ${totQty.toLocaleString()} pcs · <b>${fmtMoney(totAmt)}</b> total. ${anState.sort==='name' ? (anState.soldDir==='desc' ? 'Z to A by product name.' : 'A to Z by product name.') : anState.sort==='qty' ? 'Highest quantity first.' : 'Highest first.'} Products are listed exactly as typed on the memos${byModel?'':' (models are not separated)'}. Total amount = the memo total; when a memo has several products its total is shared between them (by value, or by quantity if prices are not set).</p>
       ${sold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th>${byModel?'<th>Model No.</th>':''}${multi?'<th>Business</th>':''}<th class="right">Memos</th><th class="right">Qty sold</th><th class="right">Total amount</th><th style="min-width:120px;"></th></tr></thead><tbody>
         ${sold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td>${byModel?`<td class="mono">${esc(r.model||'—')}</td>`:''}${multi?`<td>${esc(bizName(r.biz))}</td>`:''}<td class="right mono">${r.memos}</td><td class="right mono">${r.qty.toLocaleString()}</td><td class="right mono"><b>${fmtMoney(r.amount)}</b></td>
           <td><div class="hbar-track"><div class="hbar-fill" style="width:${Math.max(1.5,(anState.sort==='qty'?r.qty:r.amount)/topAmt*100).toFixed(1)}%"></div></div></td></tr>`).join('')}
         <tr style="font-weight:700; background:var(--paper);"><td></td><td>Total</td>${byModel?'<td></td>':''}${multi?'<td></td>':''}<td class="right mono">${sold.reduce((a,r)=>a+r.memos,0)}</td><td class="right mono">${totQty.toLocaleString()}</td><td class="right mono">${fmtMoney(totAmt)}</td><td></td></tr>
-        </tbody></table></div>` : emptyState('📦','No product sales in this range','Quantities sold appear here once memos include products.')}
+        </tbody></table></div>` : emptyState('📦','No product sales in this range',(df||dt) ? 'No product lines between '+anRangeLabel()+'. Clear the date filter or check that memos in this range include products.' : 'Quantities sold appear here once memos include products.')}
     </div>
 
     <div class="card">
-      <div class="section-head"><h2>🕸️ Products not sold</h2><span><span class="badge-count">${unsold.length} ${byModel?'product(s)':'product name(s)'}</span> <button class="btn btn-sm btn-primary" id="btnPrintUnsold" type="button">🖨 Print / PDF</button></span></div>
-      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${byModel?'Models in Product Details that no memo has sold':'Product names in Product Details that no memo has sold'} ${(df||dt)?'in this date range':'yet'}.${byModel?' A memo that names a product without a model counts as a sale of every model of that name.':''}</p>
+      <div class="section-head"><h2>🕸️ Products not sold</h2><span><span class="badge-count">${unsold.length} ${byModel?'product(s)':'product name(s)'}</span> <button class="btn btn-sm btn-primary" id="btnUnsoldDir" type="button" title="Sorted by product name — click to reverse">By name ${anState.unsoldDir==='desc' ? '(Z–A)' : '(A–Z)'}</button> <button class="btn btn-sm btn-primary" id="btnPrintUnsold" type="button">🖨 Print / PDF</button></span></div>
+      <p class="text-soft" style="font-size:12.5px; margin:0 0 10px;">${byModel?'Models in Product Details that no memo has sold':'Product names in Product Details that no memo has sold'} on the ${pm==='promo'?'Promotional Sales':'Sales Target'} side ${(df||dt)?'in this date range':'yet'}.${byModel?' A memo that names a product without a model counts as a sale of every model of that name.':''}</p>
       ${unsold.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Product</th>${byModel?'<th>Model No.</th>':''}${multi?'<th>Business</th>':''}${byModel?'<th class="right">In stock</th><th class="right">Price</th>':'<th class="right">Models in list</th><th class="right">In stock</th>'}</tr></thead><tbody>
         ${unsold.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r.name)}</td>${byModel?`<td class="mono">${esc(r.model||'—')}</td>`:''}${multi?`<td>${esc(bizName(r.biz))}</td>`:''}${byModel?`<td class="right mono">${r.stock}</td><td class="right mono">${fmtMoney(r.price)}</td>`:`<td class="right mono">${r.models}</td><td class="right mono">${r.stock}</td>`}</tr>`).join('')}
         </tbody></table></div>` : emptyState('✅','Everything has sold','All products in Product Details have at least one sale.')}
     </div>`;
   view.querySelectorAll('[data-an-biz]').forEach(el=>el.onclick = ()=>{ anState.biz = el.dataset.anBiz; renderAnalytics(); });
+  view.querySelectorAll('[data-an-mode]').forEach(el=>el.onclick = ()=>{ anState.mode = el.dataset.anMode; renderAnalytics(); });
   view.querySelectorAll('[data-an-scope]').forEach(el=>el.onclick = ()=>{ anState.scope = el.dataset.anScope; renderAnalytics(); });
   view.querySelectorAll('[data-an-group]').forEach(el=>el.onclick = ()=>{ anState.group = el.dataset.anGroup; renderAnalytics(); });
-  view.querySelectorAll('[data-an-sort]').forEach(el=>el.onclick = ()=>{ anState.sort = el.dataset.anSort; renderAnalytics(); });
+  view.querySelectorAll('[data-an-sort]').forEach(el=>el.onclick = ()=>{
+    const k = el.dataset.anSort;
+    if(k==='name' && anState.sort==='name') anState.soldDir = anState.soldDir==='desc' ? 'asc' : 'desc';   /* click "By name" again to reverse */
+    else if(k==='name') anState.soldDir = 'asc';
+    anState.sort = k; renderAnalytics();
+  });
+  const us = document.getElementById('btnUnsoldDir'); if(us) us.onclick = ()=>{ anState.unsoldDir = anState.unsoldDir==='desc' ? 'asc' : 'desc'; renderAnalytics(); };
   document.getElementById('anFrom').onchange = e=>{ anState.from = e.target.value; renderAnalytics(); };
   document.getElementById('anTo').onchange = e=>{ anState.to = e.target.value; renderAnalytics(); };
   document.getElementById('anClear').onclick = ()=>{ anState.from = ''; anState.to = ''; renderAnalytics(); };
-  const scopeName = multi ? 'All businesses' : bizName(anState.biz);
-  document.getElementById('btnPrintOverview').onclick = ()=>openPrintPreview('Target Pace, Month-wise Trend & Salesman Ranking — '+scopeName+' ('+anRangeLabel()+')', analyticsOverviewPrintHtml(), 'promaxis_pace_trend_ranking_'+todayStr());
-  document.getElementById('btnPrintSold').onclick = ()=>openPrintPreview('Product-wise Sales — '+scopeName+' ('+anRangeLabel()+')', analyticsSoldPrintHtml(), 'promaxis_product_wise_sales_'+todayStr());
-  document.getElementById('btnPrintUnsold').onclick = ()=>openPrintPreview('Products Not Sold — '+scopeName+' ('+anRangeLabel()+')', analyticsUnsoldPrintHtml(), 'promaxis_products_not_sold_'+todayStr());
+  const scopeName = (anState.mode==='promo' ? 'Promotional Sales — ' : 'Sales Target — ') + (multi ? 'All businesses' : bizName(anState.biz));
+  document.getElementById('btnPrintOverview').onclick = ()=>openPrintPreview('Pace, Month-wise Trend & Salesman Ranking — '+scopeName+' ('+anRangeLabel()+')', analyticsOverviewPrintHtml(), 'promaxis_'+anState.mode+'_pace_trend_ranking_'+todayStr());
+  document.getElementById('btnPrintSold').onclick = ()=>openPrintPreview('Product-wise Sales — '+scopeName+' ('+anRangeLabel()+')', analyticsSoldPrintHtml(), 'promaxis_'+anState.mode+'_product_wise_sales_'+todayStr());
+  document.getElementById('btnPrintUnsold').onclick = ()=>openPrintPreview('Products Not Sold — '+scopeName+' ('+anRangeLabel()+')', analyticsUnsoldPrintHtml(), 'promaxis_'+anState.mode+'_products_not_sold_'+todayStr());
   document.getElementById('btnAnExcel').onclick = analyticsExcel;
 }
 function analyticsTables(){
   const keys = anKeys(), df = anState.from, dt = anState.to, multi = anState.biz==='all';
-  const pace = paceRows(keys).map(r=>[bizName(r.bk), targetPeriodLabel(r.bk), fmtMoney(r.achieved), fmtMoney(r.target), r.pct+'%',
-    r.pc.state==='running' ? fmtMoney(r.pc.projected)+' ('+r.pc.projPct+'%)' : paceLabel(r.pc), r.pc.left!=null ? r.pc.left : '', r.pc.state==='running' && r.pc.left>0 ? fmtMoney(r.pc.perDay) : '']);
-  const trend = monthlyTrend(keys, 12, df, dt);
-  const rank = rankSalesmen(keys, anState.scope, df, dt);
-  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group), byModel = anState.group==='model';
+  const isPromo = anState.mode==='promo';
+  let pace, paceHead, paceName;
+  if(isPromo){
+    paceName = 'Promotional Sales summary';
+    paceHead = ['Business','Date range','Promotional Sales','Memos','Avg per memo'];
+    const rangeTxt = (df||dt) ? `${df?fmtDateNice(df):'start'} – ${dt?fmtDateNice(dt):'today'}` : 'All dates';
+    pace = keys.map(bk=>{
+      const fg = promoSummaryFigures(bk, df, dt);
+      if(fg.achieved<=0 && fg.count<=0) return null;
+      return [bizName(bk), rangeTxt, fmtMoney(fg.achieved), fg.count, fg.count ? fmtMoney(Math.round(fg.achieved/fg.count)) : '—'];
+    }).filter(Boolean);
+  } else {
+    paceName = 'Target pace';
+    paceHead = ['Business','Target period','Achieved','Target','Achieve %','Projected at period end','Days left','Needed per day'];
+    pace = paceRows(keys, 'target').filter(r=>r.achieved>0).map(r=>[bizName(r.bk), targetPeriodLabel(r.bk), fmtMoney(r.achieved), fmtMoney(r.target), r.pct+'%',
+      r.pc.state==='running' ? fmtMoney(r.pc.projected)+' ('+r.pc.projPct+'%)' : paceLabel(r.pc), r.pc.left!=null ? r.pc.left : '', r.pc.state==='running' && r.pc.left>0 ? fmtMoney(r.pc.perDay) : '']);
+  }
+  const trend = monthlyTrend(keys, 12, df, dt, anState.mode);
+  const rank = rankSalesmen(keys, anState.scope, df, dt, anState.mode);
+  const {sold, unsold} = rankProducts(keys, df, dt, anState.sort, anState.group, anState.soldDir, anState.unsoldDir, anState.mode), byModel = anState.group==='model';
   const totQty = sold.reduce((a,r)=>a+r.qty,0), totAmt = sold.reduce((a,r)=>a+r.amount,0), totMemos = sold.reduce((a,r)=>a+r.memos,0);
-  return {keys, multi, byModel, trend, rank, sold, unsold, pace, totQty, totAmt,
-    paceHead:['Business','Target period','Achieved','Target','Achieve %','Projected at period end','Days left','Needed per day'],
+  /* Promo ranking: never include Achieve % column */
+  const rankShowPct = !isPromo && anState.scope==='period';
+  return {keys, multi, byModel, trend, rank, sold, unsold, pace, paceName, totQty, totAmt,
+    paceHead,
     trendHead:['Month','Total sales','Promotional sales','Memos'], trendRows:trend.map(t=>[t.label, fmtMoney(t.total), fmtMoney(t.promo), t.count]),
-    rankHead:['#','Salesman'].concat(multi?['Business']:[]).concat(['Amount'], anState.scope==='period'?['Achieve %']:[]),
-    rankRows:rank.map((r,i)=>[i+1, r.name].concat(multi?[bizName(r.biz)]:[]).concat([fmtMoney(r.value)], anState.scope==='period'?[r.pct+'%']:[])),
+    rankHead:['#','Salesman'].concat(multi?['Business']:[]).concat(['Amount'], rankShowPct?['Achieve %']:[]),
+    rankRows:rank.map((r,i)=>[i+1, r.name].concat(multi?[bizName(r.biz)]:[]).concat([fmtMoney(r.value)], rankShowPct?[r.pct+'%']:[])),
     soldHead:['#','Product'].concat(byModel?['Model No.']:[]).concat(multi?['Business']:[]).concat(['Memos','Qty sold','Total amount']),
     soldRows:sold.map((r,i)=>[i+1, r.name].concat(byModel?[r.model||'—']:[]).concat(multi?[bizName(r.biz)]:[]).concat([r.memos, r.qty, fmtMoney(r.amount)])),
     soldTotal:['','Total'].concat(byModel?['']:[]).concat(multi?['']:[]).concat([totMemos, totQty, fmtMoney(totAmt)]),
@@ -5676,28 +5796,31 @@ function analyticsTables(){
     unsoldRows:unsold.map((r,i)=>[i+1, r.name].concat(byModel?[r.model||'—']:[]).concat(multi?[bizName(r.biz)]:[]).concat(byModel?[r.stock, fmtMoney(r.price)]:[r.models, r.stock]))};
 }
 function analyticsScopeLine(t, withRange){
-  return `<div style="font-size:13px; margin-bottom:8px;"><b>Scope:</b> ${esc(t.multi?'All businesses':bizName(anState.biz))} &nbsp; ${withRange?`<b>Date range:</b> ${esc(anRangeLabel())} &nbsp; `:''}<b>Printed:</b> ${esc(new Date().toLocaleString())}</div>`;
+  return `<div style="font-size:13px; margin-bottom:8px;"><b>Data:</b> ${anState.mode==='promo' ? 'Promotional Sales' : 'Sales Target'} only &nbsp; <b>Scope:</b> ${esc(t.multi?'All businesses':bizName(anState.biz))} &nbsp; ${withRange?`<b>Date range:</b> ${esc(anRangeLabel())} &nbsp; `:''}<b>Printed:</b> ${esc(new Date().toLocaleString())}</div>`;
 }
 /* one print for Target pace + Month-wise trend + Salesman ranking */
 function analyticsOverviewPrintHtml(){
   const t = analyticsTables();
+  const isPromo = anState.mode==='promo';
   const chart = t.trend.length ? svgColumns(t.trend.map(x=>({label:x.label, v:[x.total, x.promo]})), ['#0FB5A6','#C99B3F'], ['Total sales','Promotional sales'], 'Month-wise sales trend').replace(/var\(--line\)/g,'#E3E6F0').replace(/var\(--ink-soft\)/g,'#4B5563') : '';
   return analyticsScopeLine(t, true)
-    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">Target pace follows each business's session period; the date range applies to the trend and to the ranking when it is set to “All memos”.</div>
-    <h3>Target pace</h3>${tableHtml(t.paceHead, t.pace)}
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${isPromo
+      ? 'Promotional Sales summary counts only Promotional Sales memos (date filter above, or all dates). No targets or percentages.'
+      : 'Target pace: session period set → every memo (either side) in the period counts; no period → only Sales Target side memos. Same rule as Reports & Summary.'} The date range applies to the trend and to the ranking when it is set to “All memos”.</div>
+    <h3>${esc(t.paceName)}</h3>${t.pace.length ? tableHtml(t.paceHead, t.pace) : `<div style="font-size:12.5px; color:#4B5563; margin-bottom:8px;">${isPromo ? 'No promotional sales in this date range.' : 'No business has achieved sales in its target period.'}</div>`}
     <h3>Month-wise trend</h3>${chart ? `<div style="max-width:720px;">${chart}</div>` : ''}${tableHtml(t.trendHead, t.trendRows)}
-    <h3>Salesman ranking (${anState.scope==='period'?'target period':'all memos'})</h3>${tableHtml(t.rankHead, t.rankRows.slice(0,40))}`;
+    <h3>Salesman ranking (${anState.scope==='period'?(isPromo?'session period':'target period'):'all memos'})</h3>${tableHtml(t.rankHead, t.rankRows.slice(0,40))}`;
 }
 function analyticsSoldPrintHtml(){
   const t = analyticsTables();
   return analyticsScopeLine(t, true)
-    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.sold.length} product(s) sold, highest ${anState.sort==='qty'?'quantity':'amount'} first, ${t.byModel?'grouped by product name + model':'grouped by product name'} exactly as typed on the memos. Total amount = the memo total; when a memo has several products it is shared between them.</div>`
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.sold.length} product(s) sold, ${anState.sort==='name' ? (anState.soldDir==='desc'?'Z to A':'A to Z')+' by product name' : 'highest '+(anState.sort==='qty'?'quantity':'amount')+' first'}, ${t.byModel?'grouped by product name + model':'grouped by product name'} exactly as typed on the memos. Total amount = the memo total; when a memo has several products it is shared between them.</div>`
     + tableHtml(t.soldHead, t.soldRows.concat(t.sold.length ? [t.soldTotal] : []));
 }
 function analyticsUnsoldPrintHtml(){
   const t = analyticsTables();
   return analyticsScopeLine(t, true)
-    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.unsold.length} ${t.byModel?'product(s)':'product name(s)'} in Product Details with no sales ${(anState.from||anState.to)?'in this date range':'yet'}.</div>`
+    + `<div style="font-size:12px; color:#4B5563; margin-bottom:6px;">${t.unsold.length} ${t.byModel?'product(s)':'product name(s)'} in Product Details with no ${anState.mode==='promo' ? 'Promotional Sales' : 'Sales Target'} sales ${(anState.from||anState.to)?'in this date range':'yet'}, ${anState.unsoldDir==='desc'?'Z to A':'A to Z'} by product name.</div>`
     + tableHtml(t.unsoldHead, t.unsoldRows);
 }
 function analyticsExcel(){
@@ -5707,8 +5830,8 @@ function analyticsExcel(){
     const wb = XLSX.utils.book_new();
     const add = (name, head, rows)=>XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head, ...(rows.length?rows:[[]])]), name);
     add('Product-wise sales', t.soldHead, t.soldRows.concat(t.sold.length?[t.soldTotal]:[])); add('Products not sold', t.unsoldHead, t.unsoldRows);
-    add('Salesman ranking', t.rankHead, t.rankRows); add('Month-wise trend', t.trendHead, t.trendRows); add('Target pace', t.paceHead, t.pace);
-    XLSX.writeFile(wb, 'promaxis_analytics_'+todayStr()+'.xlsx'); toast('Excel file downloaded');
+    add('Salesman ranking', t.rankHead, t.rankRows); add('Month-wise trend', t.trendHead, t.trendRows); add(t.paceName, t.paceHead, t.pace);
+    XLSX.writeFile(wb, 'promaxis_analytics_'+(anState.mode==='promo' ? 'promotional_sales' : 'sales_target')+'_'+todayStr()+'.xlsx'); toast('Excel file downloaded');
   }catch(e){ toast('Excel export failed: '+e.message, 'danger'); }
 }
 
@@ -5823,8 +5946,20 @@ function renderReportContractor(){
 const WA_DEFAULT = {
   status:"Dear {name},\n{business} — Target status ({period})\nTarget: {target}\nAchieved: {achieved} ({pct}%)\nRemaining: {remaining}\nThank you.",
   remind:"Dear {name}, only {days_left} day(s) are left to complete your {business} target. {remaining} is still remaining (achieved {pct}%). To reach the target you need to sell about {per_day} per day. We count on your best effort. Thank you.",
-  congrats:"Congratulations {name}! 🎉 You have achieved your {business} target — {achieved} ({pct}%).{incentive_line} Thank you."
+  congrats:"Congratulations {name}! 🎉 You have achieved your {business} target — {achieved} ({pct}%).{incentive_line} Thank you.",
+  /* Promotional Sales messages (v4.7.4) */
+  promo_status:"Dear {name},\n{business} — Promotional Sales update ({period})\nTotal sales: {total_sales}\nPromotional sales: {promo_sales}\nMemos: {memos}\nRank: #{rank} of {rank_of}\nThank you.",
+  promo_nudge:"Dear {name}, no {business} sales have been recorded on your account yet ({period}). Please share your memos so they can be entered. Thank you.",
+  promo_top:"Congratulations {name}! 🏆 You are #1 in {business} sales — total sales {total_sales}, promotional sales {promo_sales} ({memos} memos). Keep up the great work! Thank you.",
+  /* Memo messages (v4.7.6) — usable for both Sales Target and Promotional Sales accounts */
+  memo_remind:"Dear {name}, this is a reminder to send us your pending {business} memos. Please send every memo you have written so that we can enter it into your account without delay. Thank you.",
+  memo_urgent:"Dear {name}, very little time is left to send your {business} memos. Please send all your pending memos today so that none of them is missed. Thank you.",
+  memo_daily:"Dear {name}, a friendly reminder to send your {business} memos every day. Sending them regularly keeps your account up to date and avoids a rush at the end. Thank you.",
+  memo_mark:"Dear {name}, please mark the promotional products correctly on every {business} memo. Write the exact product name, the correct model number and the right quantity on each line, so that your promotional sales are counted correctly. Memos with missing or unclear product details cannot be matched. Thank you.",
+  memo_correct:"Dear {name}, some of your {business} memos have missing or unclear details (memo number, date, product name or model, quantity or total). Please check them and send us the corrected copies. Thank you.",
+  memo_thanks:"Dear {name}, thank you for sending your {business} memos on time. Please keep it up. Thank you."
 };
+const WA_PROMO_VARS = ['name','business','period','total_sales','promo_sales','memos','rank','rank_of','top_account','top_sales','date'];
 const WA_VARS = ['name','business','period','target','achieved','pct','remaining','days_left','per_day','projected_pct','incentive','incentive_line','date'];
 function waTemplates(){ return Object.assign({}, WA_DEFAULT, Store.get('wa_tpl', {})); }
 const phoneKey = (biz, name)=>biz+'||'+name;
@@ -5861,16 +5996,40 @@ function waAutoKey(bk, name){
   return 'status';
 }
 const WA_KEY_LABEL = {status:'Status update', remind:'Reminder (behind pace)', congrats:'Congratulations'};
+const WA_PROMO_KEY_LABEL = {promo_status:'Promotional sales update', promo_nudge:'No sales yet (reminder)', promo_top:'Top seller (congratulations)'};
+const WA_MEMO_KEY_LABEL = {memo_remind:'Memo reminder — send pending memos', memo_urgent:'Memo reminder — little time left', memo_daily:'Memo reminder — send every day', memo_mark:'Memo — mark promotional products correctly', memo_correct:'Memo — correct missing or unclear details', memo_thanks:'Memo — thank you for sending on time'};
+/* Promotional Sales: one row per salesman, highest total first. With a filter on, the figures (and the ranking) come from just the matching memos. */
+function waPromoRows(bk, f){
+  const act = !!(f && isFilterActive(f));
+  return listStats(bk, 'promo', act ? f : null).slice().sort((a,b)=>b.total-a.total);
+}
+function waPromoVarsFrom(bk, name, rows, f){
+  const act = !!(f && isFilterActive(f));
+  const i = rows.findIndex(r=>r.name===name), st = i>=0 ? rows[i] : {total:0, promo:0, count:0}, top = rows[0];
+  return {name, business:bizName(bk), period:act ? lfLabel(f) : 'All time', total_sales:moneyPlain(st.total), promo_sales:moneyPlain(st.promo),
+    memos:String(st.count), rank:String(i>=0 ? i+1 : rows.length), rank_of:String(rows.length), top_account:top ? top.name : '', top_sales:top ? moneyPlain(top.total) : moneyPlain(0), date:fmtDateNice(todayStr())};
+}
+function waPromoAutoKey(rows, name){
+  const i = rows.findIndex(r=>r.name===name);
+  if(i<0 || !(rows[i].total>0)) return 'promo_nudge';
+  return i===0 ? 'promo_top' : 'promo_status';
+}
+/* "Sent today" ticks are kept apart for the two kinds of message, so a Target reminder does not mark the Promotional message as sent. */
+const waSentKey = (bk, name, mode)=>(mode==='promo' ? 'promo::' : '')+phoneKey(bk, name);
 function waSentToday(){ return Store.get('wa_sent_'+todayStr(), {}); }
-function markWaSent(bk, name){ const s = waSentToday(); s[phoneKey(bk,name)] = true; Store.set('wa_sent_'+todayStr(), s); }
-function openWhatsAppModal(bk, name){
-  const tpls = waTemplates(), vars = waVars(bk, name);
-  let key = waAutoKey(bk, name);
+function markWaSent(bk, name, mode){ const s = waSentToday(); s[waSentKey(bk, name, mode)] = true; Store.set('wa_sent_'+todayStr(), s); }
+function openWhatsAppModal(bk, name, mode, f){
+  mode = mode || 'target';
+  const isPromo = mode==='promo', fAct = isPromo && !!(f && isFilterActive(f));
+  const rows = isPromo ? waPromoRows(bk, fAct ? f : null) : null;
+  const vars = isPromo ? waPromoVarsFrom(bk, name, rows, fAct ? f : null) : waVars(bk, name);
+  const labels = Object.assign({}, isPromo ? WA_PROMO_KEY_LABEL : WA_KEY_LABEL, WA_MEMO_KEY_LABEL);
+  let key = isPromo ? waPromoAutoKey(rows, name) : waAutoKey(bk, name);
   openModal({
-    title:'📲 WhatsApp — '+name,
-    bodyHtml:`<div class="field-row">
+    title:'📲 WhatsApp — '+(isPromo ? 'Promotional Sales — ' : '')+name,
+    bodyHtml:`${fAct ? `<div class="badge-count" style="margin-bottom:10px; display:inline-block;">Numbers follow the filter: ${esc(lfLabel(f))}</div>` : ''}<div class="field-row">
         <div class="field"><label>WhatsApp number</label><input type="tel" id="waPhone" value="${esc(getPhone(bk,name))}" placeholder="01XXXXXXXXX"/></div>
-        <div class="field"><label>Message type</label><select id="waKey">${Object.keys(WA_KEY_LABEL).map(k=>`<option value="${k}" ${k===key?'selected':''}>${WA_KEY_LABEL[k]}${k===key?' (suggested)':''}</option>`).join('')}</select></div>
+        <div class="field"><label>Message type</label><select id="waKey">${Object.keys(labels).map(k=>`<option value="${k}" ${k===key?'selected':''}>${labels[k]}${k===key?' (suggested)':''}</option>`).join('')}</select></div>
       </div>
       <div class="field"><label>Message <span class="text-soft" style="font-weight:400;">(you can edit before sending)</span></label><textarea id="waMsg" rows="9" style="width:100%; font-family:inherit;"></textarea></div>
       <label style="display:flex; gap:8px; align-items:center; font-size:13px;"><input type="checkbox" id="waRemember" checked/> Remember this number for ${esc(name)}</label>`,
@@ -5884,37 +6043,62 @@ function openWhatsAppModal(bk, name){
       document.getElementById('waSend').onclick = ()=>{
         const ph = document.getElementById('waPhone').value.trim();
         if(document.getElementById('waRemember').checked && ph !== getPhone(bk,name)) setPhone(bk, name, ph);
-        markWaSent(bk, name);
+        markWaSent(bk, name, mode);
         window.open(waLink(ph, msg.value), '_blank', 'noopener');
       };
     }
   });
 }
 let waBulkOnlyBehind = true;
-function openWhatsAppBulk(bk){
+let waBulkHideZero = false;
+let waBulkKind = 'auto';
+function openWhatsAppBulk(bk, mode, f){
+  mode = mode || 'target';
+  const isPromo = mode==='promo', fAct = isPromo && !!(f && isFilterActive(f));
   const names = getSalesmen(bk);
+  const allLabels = Object.assign({}, isPromo ? WA_PROMO_KEY_LABEL : WA_KEY_LABEL, WA_MEMO_KEY_LABEL);
+  if(waBulkKind!=='auto' && !allLabels[waBulkKind]) waBulkKind = 'auto';
   openModal({
-    title:'📲 WhatsApp reminders — '+bizName(bk), wide:true,
+    title:'📲 WhatsApp '+(isPromo ? 'messages — Promotional Sales — ' : 'reminders — ')+bizName(bk), wide:true,
     bodyHtml:`<p class="text-soft" style="font-size:13px; margin:0 0 10px;">WhatsApp can only open one chat at a time, so tap <b>Send</b> on each row — the message is already written, you just press send inside WhatsApp. Rows turn green once opened today.</p>
-      <label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:10px;"><input type="checkbox" id="waOnlyBehind" ${waBulkOnlyBehind?'checked':''}/> Only accounts below 100% of target</label>
+      <div class="field" style="max-width:460px; margin:0 0 10px;"><label>Message to send</label><select id="waBulkKind"><option value="auto" ${waBulkKind==='auto'?'selected':''}>Auto — the suggested message for each salesman</option>${Object.keys(allLabels).map(k=>`<option value="${k}" ${waBulkKind===k?'selected':''}>${allLabels[k]}</option>`).join('')}</select></div>
+      ${fAct ? `<div class="badge-count" style="margin-bottom:10px; display:inline-block;">Numbers follow the filter: ${esc(lfLabel(f))}</div>` : ''}
+      ${isPromo
+        ? `<label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:10px;"><input type="checkbox" id="waHideZero" ${waBulkHideZero?'checked':''}/> Hide accounts with no sales <span class="text-soft">(not applied to memo messages — they go to everyone)</span></label>`
+        : `<label style="display:flex; gap:8px; align-items:center; font-size:13px; margin-bottom:10px;"><input type="checkbox" id="waOnlyBehind" ${waBulkOnlyBehind?'checked':''}/> Only accounts below 100% of target <span class="text-soft">(not applied to memo messages — they go to everyone)</span></label>`}
       <div id="waBulkList"></div>`,
     footerHtml:`<button class="btn btn-primary" data-cancel type="button">Done</button>`,
     onMount(api){
       api.overlay.querySelector('[data-cancel]').onclick = api.close;
+      const promoRows = isPromo ? waPromoRows(bk, fAct ? f : null) : null;
       const draw = ()=>{
         const sent = waSentToday();
-        const rows = names.map(n=>({n, st:salesmanStats(bk, n)})).filter(r=>!waBulkOnlyBehind || r.st.pct<100).sort((a,b)=>a.st.pct-b.st.pct);
-        document.getElementById('waBulkList').innerHTML = rows.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>Salesman</th><th class="right">Achieved</th><th class="right">%</th><th>Number</th><th>Message</th><th></th></tr></thead><tbody>
-          ${rows.map(r=>{ const done = sent[phoneKey(bk,r.n)], ph = getPhone(bk,r.n); return `<tr style="${done?'background:#E4F8F3;':''}"><td>${esc(r.n)}</td><td class="right mono">${fmtMoney(r.st.periodTotal)}</td><td class="right mono">${r.st.pct}%</td><td class="mono">${ph?esc(ph):'<span class="text-soft">no number</span>'}</td><td>${WA_KEY_LABEL[waAutoKey(bk,r.n)]}</td>
+        let rows;
+        const memoKind = waBulkKind.indexOf('memo_')===0;
+        if(isPromo) rows = promoRows.map((st,i)=>({n:st.name, st, rank:i+1})).filter(r=>!waBulkHideZero || memoKind || r.st.total>0);
+        else rows = names.map(n=>({n, st:salesmanStats(bk, n)})).filter(r=>!waBulkOnlyBehind || memoKind || r.st.pct<100).sort((a,b)=>a.st.pct-b.st.pct);
+        const head = isPromo
+          ? '<th>Salesman</th><th class="right">Total sales</th><th class="right">Promo sales</th><th class="right">Rank</th><th>Number</th><th>Message</th><th></th>'
+          : '<th>Salesman</th><th class="right">Achieved</th><th class="right">%</th><th>Number</th><th>Message</th><th></th>';
+        document.getElementById('waBulkList').innerHTML = rows.length ? `<div class="table-wrap"><table class="data-table"><thead><tr>${head}</tr></thead><tbody>
+          ${rows.map(r=>{ const done = sent[waSentKey(bk,r.n,mode)], ph = getPhone(bk,r.n);
+            const mid = isPromo
+              ? `<td class="right mono">${fmtMoney(r.st.total)}</td><td class="right mono">${fmtMoney(r.st.promo)}</td><td class="right mono">#${r.rank}</td>`
+              : `<td class="right mono">${fmtMoney(r.st.periodTotal)}</td><td class="right mono">${r.st.pct}%</td>`;
+            const lbl = waBulkKind!=='auto' ? allLabels[waBulkKind] : (isPromo ? WA_PROMO_KEY_LABEL[waPromoAutoKey(promoRows, r.n)] : WA_KEY_LABEL[waAutoKey(bk,r.n)]);
+            return `<tr style="${done?'background:#E4F8F3;':''}"><td>${esc(r.n)}</td>${mid}<td class="mono">${ph?esc(ph):'<span class="text-soft">no number</span>'}</td><td>${lbl}</td>
             <td><button class="btn btn-sm ${done?'btn-ghost':'btn-primary'}" data-wa-send="${esc(r.n)}" type="button">${done?'Sent ✓':(ph?'Send':'Pick contact')}</button></td></tr>`; }).join('')}
-          </tbody></table></div>` : emptyState('🎉','Everyone is at or above target','Untick the box above to message all accounts anyway.');
+          </tbody></table></div>` : (isPromo ? emptyState('📭','No accounts to show','Untick the box above to message all accounts.') : emptyState('🎉','Everyone is at or above target','Untick the box above to message all accounts anyway.'));
         api.overlay.querySelectorAll('[data-wa-send]').forEach(b=>b.onclick = ()=>{
           const n = b.dataset.waSend;
-          const text = waFill(waTemplates()[waAutoKey(bk,n)], waVars(bk,n));
-          markWaSent(bk, n); window.open(waLink(getPhone(bk,n), text), '_blank', 'noopener'); draw();
+          const key = waBulkKind!=='auto' ? waBulkKind : (isPromo ? waPromoAutoKey(promoRows,n) : waAutoKey(bk,n));
+          const text = waFill(waTemplates()[key], isPromo ? waPromoVarsFrom(bk,n,promoRows,fAct?f:null) : waVars(bk,n));
+          markWaSent(bk, n, mode); window.open(waLink(getPhone(bk,n), text), '_blank', 'noopener'); draw();
         });
       };
-      document.getElementById('waOnlyBehind').onchange = e=>{ waBulkOnlyBehind = e.target.checked; draw(); };
+      const ob = document.getElementById('waOnlyBehind'); if(ob) ob.onchange = e=>{ waBulkOnlyBehind = e.target.checked; draw(); };
+      const hz = document.getElementById('waHideZero'); if(hz) hz.onchange = e=>{ waBulkHideZero = e.target.checked; draw(); };
+      const kd = document.getElementById('waBulkKind'); if(kd) kd.onchange = e=>{ waBulkKind = e.target.value; draw(); };
       draw();
     }
   });
@@ -5984,7 +6168,14 @@ function settingsExtraHtml(){
     <div class="card">
       <div class="section-head"><h2>📲 WhatsApp message templates (English)</h2></div>
       <p class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Templates for the messages sent to salesmen. Available fields: ${WA_VARS.map(v=>`<span class="kbd">{${v}}</span>`).join(' ')}</p>
+      <h3 style="margin:14px 0 6px; font-size:15px;">🎯 Sales Target messages</h3>
       ${Object.keys(WA_KEY_LABEL).map(k=>`<div class="field"><label>${WA_KEY_LABEL[k]}</label><textarea data-wa-tpl="${k}" rows="4" style="width:100%; font-family:inherit;">${esc(tp[k])}</textarea></div>`).join('')}
+      <h3 style="margin:18px 0 6px; font-size:15px;">📈 Promotional Sales messages</h3>
+      <p class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Used by the WhatsApp buttons on the Promotional Sales pages. Available fields: ${WA_PROMO_VARS.map(v=>`<span class="kbd">{${v}}</span>`).join(' ')}</p>
+      ${Object.keys(WA_PROMO_KEY_LABEL).map(k=>`<div class="field"><label>${WA_PROMO_KEY_LABEL[k]}</label><textarea data-wa-tpl="${k}" rows="4" style="width:100%; font-family:inherit;">${esc(tp[k])}</textarea></div>`).join('')}
+      <h3 style="margin:18px 0 6px; font-size:15px;">📝 Memo messages (Sales Target and Promotional Sales)</h3>
+      <p class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Reminders about sending memos and writing them correctly. They can be sent from both the Sales Target and the Promotional Sales WhatsApp buttons. Available fields: ${['name','business','period','date'].map(v=>`<span class="kbd">{${v}}</span>`).join(' ')}</p>
+      ${Object.keys(WA_MEMO_KEY_LABEL).map(k=>`<div class="field"><label>${WA_MEMO_KEY_LABEL[k]}</label><textarea data-wa-tpl="${k}" rows="4" style="width:100%; font-family:inherit;">${esc(tp[k])}</textarea></div>`).join('')}
       <button class="btn btn-primary" id="btnSaveWa" type="button">Save Templates</button> <button class="btn btn-ghost" id="btnResetWa" type="button">Restore default wording</button>
     </div>`;
 }
