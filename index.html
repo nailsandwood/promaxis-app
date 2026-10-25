@@ -667,7 +667,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.7.9";
+const APP_VERSION = "4.7.10";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -2889,16 +2889,41 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
 
   function stagedListHtml(){
     if(staged.length===0) return '';
+    /* Duplicate rule (v4.7.10+): same Date + same Memo Number
+       (case-insensitive memo). Matches within this staged list OR
+       against already-saved sales for this business. */
+    const makeKey = (date, memo) => (String(date||'').trim() + '|' + String(memo||'').trim().toLowerCase());
+    const existingKeys = new Set(
+      getSales(bizKey).map(e => makeKey(e.date, e.memo)).filter(k => !k.startsWith('|') && !k.endsWith('|'))
+    );
+    const stagedKeyCount = {};
+    staged.forEach(s => {
+      const k = makeKey(s.date, s.memo);
+      if(k && !k.startsWith('|') && !k.endsWith('|')) stagedKeyCount[k] = (stagedKeyCount[k]||0) + 1;
+    });
+    const isDup = (s) => {
+      const k = makeKey(s.date, s.memo);
+      if(!k || k.startsWith('|') || k.endsWith('|')) return false;
+      return stagedKeyCount[k] > 1 || existingKeys.has(k);
+    };
+    const dupCount = staged.filter(isDup).length;
+    const labelExtra = dupCount
+      ? ` <span style="color:var(--coral);font-weight:600;">• ${dupCount} duplicate${dupCount===1?'':'s'} found</span>`
+      : '';
     return `<div class="field">
-      <label>Staged Entries <span class="text-soft" style="font-weight:400;">(${staged.length} memo${staged.length===1?'':'s'} ready — press "Add" below to save ${staged.length===1?'it':'them all'})</span></label>
+      <label>Staged Entries <span class="text-soft" style="font-weight:400;">(${staged.length} memo${staged.length===1?'':'s'} ready — press "Add" below to save ${staged.length===1?'it':'them all'})${labelExtra}</span></label>
       <div class="table-wrap"><table class="data-table">
         <thead><tr><th>Date</th><th>Memo No.</th><th>Products</th><th class="right">Total</th><th>Actions</th></tr></thead>
-        <tbody>${staged.map(s=>`<tr>
-          <td class="mono">${esc(s.date)}</td><td class="mono">${esc(s.memo)}</td>
+        <tbody>${staged.map(s=>{
+          const dup = isDup(s);
+          return `<tr class="${dup?'row-duplicate':''}">
+          <td class="mono">${esc(s.date)}</td>
+          <td class="mono">${esc(s.memo)}${dup?' <span class="badge" style="background:var(--coral);color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;margin-left:4px;vertical-align:middle;">DUP</span>':''}</td>
           <td>${(s.cleanItems||[]).map(it=>`${esc(it.productName||it.modelNumber)} ×${it.qty}`).join(', ')||'<span class="text-soft">—</span>'}</td>
           <td class="right mono">${fmtMoney(s.total)}</td>
           <td><button class="btn btn-sm btn-ghost" data-edit-staged="${s._stagedId}" type="button">Edit</button> <button class="btn btn-sm btn-danger" data-del-staged="${s._stagedId}" type="button">Delete</button></td>
-        </tr>`).join('')}</tbody>
+        </tr>`;
+        }).join('')}</tbody>
       </table></div>
     </div>`;
   }
@@ -3075,7 +3100,15 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
       function doAddToList(){
         const data = buildEntry(); if(!data) return;
         staged.push({...data, _stagedId:uid()});
-        toast('Added to list — keep entering, or press Add to save all');
+        const makeKey = (date, memo) => (String(date||'').trim() + '|' + String(memo||'').trim().toLowerCase());
+        const k = makeKey(data.date, data.memo);
+        const existingHas = k && !k.startsWith('|') && !k.endsWith('|') && getSales(bizKey).some(e => makeKey(e.date, e.memo) === k);
+        const stagedCount = staged.filter(s => makeKey(s.date, s.memo) === k).length;
+        if(existingHas || stagedCount > 1){
+          toast('⚠ Duplicate (same Date + Memo No.) — check the list below','danger');
+        } else {
+          toast('Added to list — keep entering, or press Add to save all');
+        }
         resetFormForNext();
         renderStaged();
       }
