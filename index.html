@@ -667,7 +667,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.7.10";
+const APP_VERSION = "4.8.2";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -1622,17 +1622,57 @@ function productBreakdownFromEntries(entries){
 }
 function distinctProductNames(products){ return [...new Set(products.map(p=>p.productName).filter(Boolean))].sort(); }
 
+/* v4.8.0 — A memo is a duplicate only when its DATE (day, month and year) AND its MEMO NUMBER are both the same
+   (e.g. 14/02/2026 + 1234). The same memo number on a different date is a different memo. */
+function dupDate(d){ return String(d||'').trim().slice(0,10); }
+function dupMemoNo(m){ return String(m||'').trim().replace(/\s+/g,' ').toLowerCase(); }
+function dupKey(e){ const d = dupDate(e && e.date), m = dupMemoNo(e && e.memo); return (d && m) ? d+'|'+m : ''; }
+function dmy(d){ const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(d||'')); return m ? m[3]+'/'+m[2]+'/'+m[1] : String(d||''); }
 function computeDuplicateKeys(entries){
-  /* Same memo number alone is enough to flag a duplicate, regardless of date. */
   const map = {};
   entries.forEach(e=>{
-    const k = String(e.memo||'').trim().toLowerCase();
+    const k = dupKey(e);
     if(!k) return;
     (map[k] = map[k]||[]).push(e);
   });
   const dupIds = new Set();
   Object.values(map).forEach(group=>{ if(group.length>1) group.forEach(e=>dupIds.add(e.id)); });
   return dupIds;
+}
+
+/* ---- v4.8.0 — automatic deletion of duplicate memos ----
+   Works on each side on its own - the Promotional Sales page and the Sales Target page of a salesman's account.
+   Memos of that side with the same date + memo number are duplicates: the first one (earliest-created, by id - so every PC
+   picks the same one) is kept and the extra copies go to the Recycle Bin (stock added back; restore from the bin or with Undo).
+   Memos are never deleted across the two sides. */
+function dupCfg(){ const c = Store.get('dup_cfg', {}) || {}; return {auto: c.auto!==false, keep: (c.keep && typeof c.keep==='object') ? c.keep : {}}; }
+function autoDeleteDuplicates(bizKey, name, mode){
+  const cfg = dupCfg();
+  if(!cfg.auto) return 0;
+  /* one side at a time: the Promotional page checks Promotional memos, the Target page checks the Target-side memos shown there */
+  const base = acctBaseEntries(bizKey, name, mode).filter(e=> mode==='target' ? e.source==='target' : e.source!=='target');
+  const groups = {};
+  base.forEach(e=>{ const k = dupKey(e); if(!k) return; (groups[k] = groups[k]||[]).push(e); });
+  const remove = new Set(), keepKeys = [];
+  Object.keys(groups).forEach(k=>{
+    const g = groups[k];
+    if(g.length<2) return;
+    const scopeKey = bizKey+'|'+name+'|'+(mode==='target'?'T':'P')+'|'+k;
+    if(cfg.keep[scopeKey]) return;                 /* restored with Undo — the person chose to keep these */
+    g.sort((a,b)=> String(a.id)<String(b.id)?-1:(String(a.id)>String(b.id)?1:0));
+    g.slice(1).forEach(e=>remove.add(e.id));
+    keepKeys.push(scopeKey);
+  });
+  if(!remove.size) return 0;
+  saveSales(bizKey, getSales(bizKey).filter(e=>!remove.has(e.id)), {label:'Auto-deleted duplicate memo — '+name+(mode==='target'?' (Sales Target)':' (Promotional Sales)')});
+  const trashId = _lastTrashId;
+  toast(remove.size+' duplicate memo'+(remove.size===1?'':'s')+' (same date + memo number) auto-deleted from '+name+' — the first one is kept.', 'danger', {undo:()=>{
+    if(trashId && restoreTrashItem(trashId)){
+      const c = dupCfg(); keepKeys.forEach(k=>{ c.keep[k] = true; }); Store.set('dup_cfg', c);
+      toast('Restored — kept, shown as Duplicate'); route();
+    }
+  }});
+  return remove.size;
 }
 
 /* One salesman's entries as they appear in that mode's account view: Sales
@@ -2580,6 +2620,7 @@ function renderSalesAccountView(bizKey, name, mode){
   const routePrefix = isTarget ? 'target' : 'sales';
   if(!bizKey || !BUSINESSES.find(b=>b.key===bizKey) || !name){ location.hash = routePrefix+'/'+(bizKey||''); return; }
   setTitle((isTarget ? 'Sales Target — ' : 'Promotional Sales — ')+bizName(bizKey)+' — '+name);
+  autoDeleteDuplicates(bizKey, name, mode);   /* v4.8.0: same date + same memo number -> extra copies go to the Recycle Bin */
   const avs = getAVS(bizKey, name);
   const showCt = bizHasCtPromo(bizKey);
 
@@ -2660,7 +2701,7 @@ function renderSalesAccountView(bizKey, name, mode){
       </div>
     </div>
 
-    <p class="hint" style="margin:4px 0 10px;">If a memo has more than one promotional product, add every product as its own row inside the <b>same</b> entry — entering them as separate memos will be flagged <b>Duplicate</b> in red below; a clean, unique memo shows <b>OK</b> in green.${isTarget ? ` Only memos dated within the target period (<b>${esc(targetPeriodLabel(bizKey))}</b>) are listed below — Promotional Sales memos in this period are pulled in automatically, and any memo added here counts only toward Sales Target, not Promotional Sales.` : ''}</p>
+    <p class="hint" style="margin:4px 0 10px;">If a memo has more than one promotional product, add every product as its own row inside the <b>same</b> entry. A memo is a <b>Duplicate</b> only when its <b>date and memo number are both the same</b> as another memo in this account — it is shown in red and deleted automatically (it stays in the Recycle Bin). A unique memo shows <b>OK</b> in green.${isTarget ? ` Only memos dated within the target period (<b>${esc(targetPeriodLabel(bizKey))}</b>) are listed below — Promotional Sales memos in this period are pulled in automatically, and any memo added here counts only toward Sales Target, not Promotional Sales.` : ''}</p>
 
     <div class="table-wrap">
       <table class="data-table" id="salesTable">
@@ -2889,41 +2930,16 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
 
   function stagedListHtml(){
     if(staged.length===0) return '';
-    /* Duplicate rule (v4.7.10+): same Date + same Memo Number
-       (case-insensitive memo). Matches within this staged list OR
-       against already-saved sales for this business. */
-    const makeKey = (date, memo) => (String(date||'').trim() + '|' + String(memo||'').trim().toLowerCase());
-    const existingKeys = new Set(
-      getSales(bizKey).map(e => makeKey(e.date, e.memo)).filter(k => !k.startsWith('|') && !k.endsWith('|'))
-    );
-    const stagedKeyCount = {};
-    staged.forEach(s => {
-      const k = makeKey(s.date, s.memo);
-      if(k && !k.startsWith('|') && !k.endsWith('|')) stagedKeyCount[k] = (stagedKeyCount[k]||0) + 1;
-    });
-    const isDup = (s) => {
-      const k = makeKey(s.date, s.memo);
-      if(!k || k.startsWith('|') || k.endsWith('|')) return false;
-      return stagedKeyCount[k] > 1 || existingKeys.has(k);
-    };
-    const dupCount = staged.filter(isDup).length;
-    const labelExtra = dupCount
-      ? ` <span style="color:var(--coral);font-weight:600;">• ${dupCount} duplicate${dupCount===1?'':'s'} found</span>`
-      : '';
     return `<div class="field">
-      <label>Staged Entries <span class="text-soft" style="font-weight:400;">(${staged.length} memo${staged.length===1?'':'s'} ready — press "Add" below to save ${staged.length===1?'it':'them all'})${labelExtra}</span></label>
+      <label>Staged Entries <span class="text-soft" style="font-weight:400;">(${staged.length} memo${staged.length===1?'':'s'} ready — press "Add" below to save ${staged.length===1?'it':'them all'})</span></label>
       <div class="table-wrap"><table class="data-table">
         <thead><tr><th>Date</th><th>Memo No.</th><th>Products</th><th class="right">Total</th><th>Actions</th></tr></thead>
-        <tbody>${staged.map(s=>{
-          const dup = isDup(s);
-          return `<tr class="${dup?'row-duplicate':''}">
-          <td class="mono">${esc(s.date)}</td>
-          <td class="mono">${esc(s.memo)}${dup?' <span class="badge" style="background:var(--coral);color:#fff;font-size:10px;padding:1px 5px;border-radius:4px;margin-left:4px;vertical-align:middle;">DUP</span>':''}</td>
+        <tbody>${staged.map(s=>`<tr>
+          <td class="mono">${esc(s.date)}</td><td class="mono">${esc(s.memo)}</td>
           <td>${(s.cleanItems||[]).map(it=>`${esc(it.productName||it.modelNumber)} ×${it.qty}`).join(', ')||'<span class="text-soft">—</span>'}</td>
           <td class="right mono">${fmtMoney(s.total)}</td>
           <td><button class="btn btn-sm btn-ghost" data-edit-staged="${s._stagedId}" type="button">Edit</button> <button class="btn btn-sm btn-danger" data-del-staged="${s._stagedId}" type="button">Delete</button></td>
-        </tr>`;
-        }).join('')}</tbody>
+        </tr>`).join('')}</tbody>
       </table></div>
     </div>`;
   }
@@ -2940,6 +2956,7 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
           <div class="total-calc" id="totalCalc"></div>
         </div>
       </div>
+      <div id="dupNotice" style="display:none; margin:-4px 0 12px; padding:8px 10px; border-radius:8px; background:var(--coral-bg); color:var(--coral); font-size:13px; font-weight:600;"></div>
       ${contractorList.length ? `<div class="field"><label>Contractor <span class="text-soft" style="font-weight:400;">(optional — credits contractor promo to this contractor)</span></label><select id="fContractor"><option value="">— none —</option>${contractorList.map(c=>`<option value="${esc(c)}" ${existing&&existing.contractor===c?'selected':''}>${esc(c)}</option>`).join('')}</select></div>` : ''}
       <div class="field">
         <label>Promotional Product Sales <span class="text-soft" style="font-weight:400;">(add every product sold under this memo as its own row — up to 100 • <span class="kbd">Tab</span>/<span class="kbd">Enter</span> forward, <span class="kbd">Shift+Tab</span>/<span class="kbd">Backspace</span> back between Product Name and Model No.)</span></label>
@@ -3046,6 +3063,7 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
       function renderStaged(){
         document.getElementById('stagedWrap').innerHTML = stagedListHtml();
         wireStagedButtons();
+        refreshDupNotice();
       }
       function wireStagedButtons(){
         api.overlay.querySelectorAll('[data-edit-staged]').forEach(b=>{
@@ -3076,6 +3094,31 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
       }
       wireStagedButtons();
 
+      /* v4.8.0 — duplicate check while entering: same salesman account, same date + same memo number,
+         against what is already saved in this account's list and against the staged (Add to List) entries. */
+      function findDup(date, memo, salesman){
+        const k = dupKey({date, memo});
+        if(!k || !salesman) return null;
+        if(existing && existing.salesman===salesman && dupKey(existing)===k) return null;   /* date + memo not changed */
+        if(acctBaseEntries(bizKey, salesman, mode).some(e=>(!existing || e.id!==existing.id) && dupKey(e)===k)) return 'saved';
+        if(staged.some(s=>s.salesman===salesman && dupKey(s)===k)) return 'staged';
+        return null;
+      }
+      function dupWhereText(w){ return w==='staged' ? 'in the Staged list below' : 'in this account'; }
+      function refreshDupNotice(){
+        const box = document.getElementById('dupNotice'); if(!box) return;
+        const date = document.getElementById('fDate').value, memo = document.getElementById('fMemo').value.trim();
+        const sm = lockedSalesman || (document.getElementById('fSalesman')||{}).value;
+        const where = findDup(date, memo, sm);
+        box.style.display = where ? 'block' : 'none';
+        box.innerHTML = where ? `⚠ Duplicate memo — ${dmy(date)} · ${esc(memo)} is already ${dupWhereText(where)}. It will not be added.` : '';
+      }
+      ['fDate','fMemo','fSalesman'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el && !el.disabled){ el.addEventListener('input', refreshDupNotice); el.addEventListener('change', refreshDupNotice); }
+      });
+      refreshDupNotice();
+
       function buildEntry(){
         const date = document.getElementById('fDate').value;
         const memo = document.getElementById('fMemo').value.trim();
@@ -3083,6 +3126,12 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
         const total = Number(document.getElementById('fTotal').value)||0;
         if(!date || !memo){ toast('Date and Memo Number are required','danger'); return null; }
         if(!salesman){ toast('Salesman account is required','danger'); return null; }
+        const dupWhere = findDup(date, memo, salesman);
+        if(dupWhere){
+          refreshDupNotice();
+          toast(`Duplicate memo — ${dmy(date)} · ${memo} is already ${dupWhereText(dupWhere)}. Change the date or memo number.`, 'danger');
+          return null;
+        }
         const cleanItems = localItems.filter(i=>i.modelNumber || i.productName).map(i=>({id:i.id, modelNumber:i.modelNumber, productName:i.productName, qty:Number(i.qty)||0}));
         const contractor = (document.getElementById('fContractor')||{}).value || '';
         return {date, memo, salesman, total, cleanItems, contractor};
@@ -3100,15 +3149,7 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
       function doAddToList(){
         const data = buildEntry(); if(!data) return;
         staged.push({...data, _stagedId:uid()});
-        const makeKey = (date, memo) => (String(date||'').trim() + '|' + String(memo||'').trim().toLowerCase());
-        const k = makeKey(data.date, data.memo);
-        const existingHas = k && !k.startsWith('|') && !k.endsWith('|') && getSales(bizKey).some(e => makeKey(e.date, e.memo) === k);
-        const stagedCount = staged.filter(s => makeKey(s.date, s.memo) === k).length;
-        if(existingHas || stagedCount > 1){
-          toast('⚠ Duplicate (same Date + Memo No.) — check the list below','danger');
-        } else {
-          toast('Added to list — keep entering, or press Add to save all');
-        }
+        toast('Added to list — keep entering, or press Add to save all');
         resetFormForNext();
         renderStaged();
       }
@@ -3124,11 +3165,20 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
         }
         if(staged.length===0){ toast('Add at least one entry first','danger'); return; }
         const list = getSales(bizKey);
+        /* last safety check: skip anything that became a duplicate meanwhile (e.g. added from another PC) */
+        const seen = new Set(), fresh = [];
+        let skipped = 0;
         staged.forEach(s=>{
+          const k = dupKey(s), sk = s.salesman+'|'+k;
+          if(k && (seen.has(sk) || acctBaseEntries(bizKey, s.salesman, mode).some(e=>dupKey(e)===k))){ skipped++; return; }
+          if(k) seen.add(sk);
+          fresh.push(s);
+        });
+        fresh.forEach(s=>{
           list.push({id:uid(), date:s.date, memo:s.memo, salesman:s.salesman, items:s.cleanItems, total:s.total, source:newEntrySource, ...(s.contractor ? {contractor:s.contractor} : {})});
         });
-        saveSales(bizKey, list);
-        toast(staged.length===1 ? 'Entry added' : staged.length+' entries added');
+        if(fresh.length) saveSales(bizKey, list);
+        toast(fresh.length ? ((fresh.length===1 ? 'Entry added' : fresh.length+' entries added') + (skipped ? ' — '+skipped+' duplicate memo skipped' : '')) : 'Nothing added — '+(skipped===1?'that memo is a duplicate':'those memos are duplicates')+' (same date + memo number)', fresh.length ? 'success' : 'danger');
         api.close();
         route();
       }
@@ -3222,11 +3272,11 @@ function openDuplicateSummary(bizKey, scopeSalesman, mode){
       <div class="sr-info"><span>#${slFor(e)}</span><span>${esc(e.date)}</span><span>Memo ${esc(e.memo)}</span>${scopeSalesman?'':`<span>${esc(e.salesman||'—')}</span>`}<span>${fmtMoney(e.total)}</span></div>
       <button class="btn btn-sm btn-danger" data-del-dup="${e.id}" type="button">Delete</button>
     </div>`;
-  }).join('') : `<div class="empty-state">No duplicate memo numbers found${scopeSalesman?' for '+esc(scopeSalesman):' for this business'}${mode==='target'?' within the target period ('+esc(targetPeriodLabel(bizKey))+')':''}.</div>`;
+  }).join('') : `<div class="empty-state">No duplicate memos found${scopeSalesman?' for '+esc(scopeSalesman):' for this business'}${mode==='target'?' within the target period ('+esc(targetPeriodLabel(bizKey))+')':''}.</div>`;
 
   openModal({
     title:'Duplicate Memo Summary — '+bizName(bizKey)+(scopeSalesman?' — '+scopeSalesman:'')+(mode==='target'?' (Target Period)':''), wide:true,
-    bodyHtml:`<div class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Rows sharing the same <b>memo number</b> within this account are flagged red in the table — a memo is only ever compared against this same account's own entries, never another salesman's.${mode==='target'?' Only memos within the target period ('+esc(targetPeriodLabel(bizKey))+') are checked here.':''} This usually means the same memo's products were entered as separate memos instead of extra rows in one entry. Click a row below to jump straight to it.</div><div id="dupList">${rowsHtml}</div>`,
+    bodyHtml:`<div class="text-soft" style="font-size:12.5px; margin-bottom:10px;">Rows sharing the same <b>date and memo number</b> within this account are flagged red in the table — a memo is only ever compared against this same account's own entries, never another salesman's. The same memo number on a different date is not a duplicate. Duplicates are deleted automatically when the account is opened (Settings &rarr; Duplicate memos).${mode==='target'?' Only memos within the target period ('+esc(targetPeriodLabel(bizKey))+') are checked here.':''} This usually means the same memo's products were entered as separate memos instead of extra rows in one entry. Click a row below to jump straight to it.</div><div id="dupList">${rowsHtml}</div>`,
     footerHtml:`<button class="btn btn-ghost" id="btnCopyDup" type="button" ${dups.length?'':'disabled'}>⧉ Copy Summary</button><button class="btn btn-primary" data-cancel type="button">Close</button>`,
     onMount(api){
       api.overlay.querySelector('[data-cancel]').onclick = api.close;
@@ -6176,6 +6226,12 @@ function settingsExtraHtml(){
   const tp = waTemplates();
   return `
     <div class="card">
+      <div class="section-head"><h2>⚠ Duplicate memos</h2></div>
+      <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-bottom:10px;"><input type="checkbox" id="dupAuto" ${dupCfg().auto?'checked':''}/> Delete duplicate memos automatically when a salesman's account is opened</label>
+      <p class="text-soft" style="font-size:12.5px;">A memo is a duplicate only when its <b>date and memo number are both the same</b> (for example 14/02/2026 + 1234) inside the same salesman's account. This works on both sides, Promotional Sales and Sales Target, each on its own: the first copy is kept and the extra copies move to the Recycle Bin, where they can be restored. While entering memos, a duplicate is flagged in red and is not added.</p>
+      <button class="btn btn-primary" id="btnSaveDup" type="button">Save</button>
+    </div>
+    <div class="card">
       <div class="section-head"><h2>📦 Stock</h2></div>
       <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-bottom:10px;"><input type="checkbox" id="stAuto" ${sc.auto?'checked':''}/> Deduct stock automatically when a memo is saved (edits and deletes adjust it back)</label>
       <label style="display:flex; gap:8px; align-items:center; font-size:13.5px; margin-bottom:10px;"><input type="checkbox" id="stAlerts" ${sc.alerts?'checked':''}/> Show low-stock alerts (Dashboard list and the warning after saving a memo)</label>
@@ -6214,6 +6270,10 @@ function settingsExtraHtml(){
 }
 function wireSettingsExtra(){
   const v = document.getElementById('view');
+  document.getElementById('btnSaveDup').onclick = ()=>{
+    const c = dupCfg(); c.auto = document.getElementById('dupAuto').checked; Store.set('dup_cfg', c);
+    toast('Duplicate-memo setting saved'); renderSettings();
+  };
   document.getElementById('btnSaveStock').onclick = ()=>{
     Store.set('stock_cfg', {auto:document.getElementById('stAuto').checked, alerts:document.getElementById('stAlerts').checked, low:Math.max(0, Number(document.getElementById('stLow').value)||0)});
     toast('Stock settings saved'); renderSettings();

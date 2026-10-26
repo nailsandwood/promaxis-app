@@ -2,7 +2,7 @@
    Strategy: the app page is "network first" (you always get the newest version when online,
    and the saved copy when offline); fonts and the Excel library are cached the first time
    they load and reused after that. Google sign-in / Drive calls are never touched. */
-const CACHE = 'promaxis-v4.7.1';
+const CACHE = 'promaxis-v4.8.2';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 const XLSX_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
 const CACHEABLE_HOSTS = ['cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];
