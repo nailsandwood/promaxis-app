@@ -582,6 +582,8 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 .slab-row{display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; font-size:13px;}
 .slab-row input[type=number]{width:96px;}
 @media (max-width:700px){ .pace-stats{grid-template-columns:1fr 1fr !important;} .hbar-row{grid-template-columns:minmax(70px,38%) 1fr; } .hbar-val{grid-column:1/-1; margin-top:-6px;} }
+.clickable-row{cursor:pointer;} .clickable-row:hover td{background:var(--paper);}
+.det-h{font-size:13px; font-weight:600; margin:14px 0 6px;}
 </style>
 
 <!-- Export libraries (loaded from CDN — require internet access in the browser) -->
@@ -667,7 +669,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.8.2";
+const APP_VERSION = "4.9.0";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -1221,7 +1223,7 @@ function deviceName(){ const c = Store.get('sync_cfg', {}) || {}; return c.devic
 function auditAdd(rows){
   if(!rows || !rows.length) return;
   const list = Store.get('audit', []), ts = new Date().toISOString(), dev = deviceName();
-  rows.forEach(r=>list.push({id:uid(), ts, dev, act:r.act, biz:r.biz||'', txt:r.txt||''}));
+  rows.forEach(r=>list.push({id:uid(), ts, dev, act:r.act, biz:r.biz||'', txt:r.txt||'', ...(r.det ? {det:r.det} : {})}));
   while(list.length > 3000) list.shift();
   Store.set('audit', list);
 }
@@ -1246,18 +1248,30 @@ function prodDiffText(o, n){
   f('price','price'); f('quantity','stock'); f('targetQuantity','target qty'); f('spQty','salesperson promo'); f('ctQty','contractor promo'); f('minStock','low-stock level');
   return bits.join('; ') || 'updated';
 }
+/* v4.9.0 — compact snapshots kept with each audit record, so a record can be opened and read in full later. */
+function snapSale(e, light){
+  const o = {date:e.date||'', memo:e.memo||'', salesman:e.salesman||'', total:Number(e.total)||0, source:e.source==='target' ? 'target' : 'promo'};
+  if(e.contractor) o.contractor = e.contractor;
+  if(!light) o.items = (e.items||[]).slice(0,60).map(i=>[i.productName||'', i.modelNumber||'', Number(i.qty)||0]);
+  return o;
+}
+function snapProd(p){
+  const o = {};
+  Object.keys(p||{}).forEach(k=>{ if(k!=='id' && k.charAt(0)!=='_' && ['string','number','boolean'].includes(typeof p[k]) && p[k]!=='') o[k] = p[k]; });
+  return o;
+}
 function auditDiff(bizKey, d, kind, opts){
-  const rows = [], L = 12;
+  const rows = [], L = 12, snap = kind==='sale' ? snapSale : snapProd;
   const desc = kind==='sale' ? entryDesc : prodDesc, dtx = kind==='sale' ? entryDiffText : prodDiffText;
   const noun = kind==='sale' ? 'memos' : 'products';
   if(opts.label && d.removed.length>1 && !d.added.length && !d.changed.length){
-    rows.push({act:'clear', biz:bizKey, txt:`${opts.label} — ${d.removed.length} ${noun} moved to Recycle Bin`});
+    rows.push({act:'clear', biz:bizKey, txt:`${opts.label} — ${d.removed.length} ${noun} moved to Recycle Bin`, det:{k:kind, lbl:opts.label, n:d.removed.length, list:d.removed.slice(0,100).map(r=>snap(r,true))}});
   } else {
-    d.added.slice(0,L).forEach(r=>rows.push({act:'add', biz:bizKey, txt:desc(r)}));
+    d.added.slice(0,L).forEach(r=>rows.push({act:'add', biz:bizKey, txt:desc(r), det:{k:kind, now:snap(r)}}));
     if(d.added.length>L) rows.push({act:'add', biz:bizKey, txt:`…and ${d.added.length-L} more ${noun} added`});
-    d.changed.slice(0,L).forEach(c=>rows.push({act:'edit', biz:bizKey, txt:desc(c.now)+' — '+dtx(c.old, c.now)}));
+    d.changed.slice(0,L).forEach(c=>rows.push({act:'edit', biz:bizKey, txt:desc(c.now)+' — '+dtx(c.old, c.now), det:{k:kind, old:snap(c.old), now:snap(c.now)}}));
     if(d.changed.length>L) rows.push({act:'edit', biz:bizKey, txt:`…and ${d.changed.length-L} more ${noun} edited`});
-    d.removed.slice(0,L).forEach(r=>rows.push({act:'delete', biz:bizKey, txt:desc(r)+' → Recycle Bin'}));
+    d.removed.slice(0,L).forEach(r=>rows.push({act:'delete', biz:bizKey, txt:desc(r)+' → Recycle Bin', det:{k:kind, old:snap(r), lbl:opts.label||''}}));
     if(d.removed.length>L) rows.push({act:'delete', biz:bizKey, txt:`…and ${d.removed.length-L} more ${noun} deleted`});
   }
   auditAdd(rows);
@@ -1299,7 +1313,7 @@ function restoreTrashItem(tid){
   }
   Store.set('trash', Store.get('trash', []).filter(x=>x.id!==tid));
   tombAdd([tid]);
-  auditAdd([{act:'restore', biz:it.biz, txt:`Restored ${recs.length} ${it.type==='sale'?'memo(s)':'product(s)'} from Recycle Bin${it.label?' — '+it.label:''}`}]);
+  auditAdd([{act:'restore', biz:it.biz, txt:`Restored ${recs.length} ${it.type==='sale'?'memo(s)':'product(s)'} from Recycle Bin${it.label?' — '+it.label:''}`, det:{k:it.type==='sale'?'sale':'product', lbl:it.label||'', n:recs.length, list:recs.slice(0,100).map(r=>it.type==='sale' ? snapSale(r,true) : snapProd(r))}}]);
   return true;
 }
 function deleteTrashItem(tid){
@@ -2361,7 +2375,24 @@ function renderSalesView(bizKey){ location.hash = 'sales/'+bizKey; }
    All Accounts Summary all change together, automatically. */
 const listFilterState = {};
 function blankLF(){ return {search:'', dateFrom:'', dateTo:'', memoFrom:'', memoTo:'', product:'', totalMin:'', totalMax:'', promoMin:'', promoMax:'', status:'', filterOpen:false}; }
-function getLF(bizKey, mode){ const k = mode+'||'+bizKey; if(!listFilterState[k]) listFilterState[k] = blankLF(); return listFilterState[k]; }
+/* v4.9.0 — the filter on the salesman accounts page (dates, memo range, product, status, amounts) is remembered, so it is still
+   there after the software is closed and opened again. The "sales_filter_" prefix keeps it on this device only, like the account filters. */
+function lfStoreKey(bizKey, mode){ return 'sales_filter_list_'+mode+'||'+bizKey; }
+function getLF(bizKey, mode){
+  const k = mode+'||'+bizKey;
+  if(!listFilterState[k]){
+    const saved = Store.get(lfStoreKey(bizKey, mode), null);
+    listFilterState[k] = saved ? {...blankLF(), ...saved, filterOpen:false} : blankLF();
+  }
+  return listFilterState[k];
+}
+function saveLF(bizKey, mode, lf){
+  const {filterOpen, ...persisted} = lf;
+  const key = lfStoreKey(bizKey, mode), cur = Store.get(key, null);
+  if(!cur && !isFilterActive(persisted)) return;                 /* nothing set, nothing stored */
+  if(cur && JSON.stringify(cur)===JSON.stringify(persisted)) return;
+  Store.set(key, persisted);
+}
 function lfLabel(f){
   const bits = [];
   if(f.dateFrom || f.dateTo) bits.push('Date '+(f.dateFrom?fmtDateNice(f.dateFrom):'…')+' – '+(f.dateTo?fmtDateNice(f.dateTo):'…'));
@@ -2442,6 +2473,7 @@ function renderSalesAccountsList(bizKey, mode){
 
   /* Repaints the filter badge, the four top cards and every salesman card from the current filter. */
   function paintList(){
+    saveLF(bizKey, mode, lf);
     const active = isFilterActive(lf);
     const stats = listStats(bizKey, mode, active ? lf : null);
     const totals = stats.reduce((a,s)=>({periodTotal:a.periodTotal+s.periodTotal, periodPromo:a.periodPromo+s.periodPromo, total:a.total+s.total, promo:a.promo+s.promo, target:a.target+s.target}), {periodTotal:0, periodPromo:0, total:0, promo:0, target:0});
@@ -2933,9 +2965,9 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
     return `<div class="field">
       <label>Staged Entries <span class="text-soft" style="font-weight:400;">(${staged.length} memo${staged.length===1?'':'s'} ready — press "Add" below to save ${staged.length===1?'it':'them all'})</span></label>
       <div class="table-wrap"><table class="data-table">
-        <thead><tr><th>Date</th><th>Memo No.</th><th>Products</th><th class="right">Total</th><th>Actions</th></tr></thead>
-        <tbody>${staged.map(s=>`<tr>
-          <td class="mono">${esc(s.date)}</td><td class="mono">${esc(s.memo)}</td>
+        <thead><tr><th>Sl No</th><th>Date</th><th>Memo No.</th><th>Products</th><th class="right">Amount</th><th>Actions</th></tr></thead>
+        <tbody>${staged.map((s,i)=>`<tr>
+          <td class="mono">${i+1}</td><td class="mono">${esc(dmy(s.date))}</td><td class="mono">${esc(s.memo)}</td>
           <td>${(s.cleanItems||[]).map(it=>`${esc(it.productName||it.modelNumber)} ×${it.qty}`).join(', ')||'<span class="text-soft">—</span>'}</td>
           <td class="right mono">${fmtMoney(s.total)}</td>
           <td><button class="btn btn-sm btn-ghost" data-edit-staged="${s._stagedId}" type="button">Edit</button> <button class="btn btn-sm btn-danger" data-del-staged="${s._stagedId}" type="button">Delete</button></td>
@@ -3100,18 +3132,24 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
         const k = dupKey({date, memo});
         if(!k || !salesman) return null;
         if(existing && existing.salesman===salesman && dupKey(existing)===k) return null;   /* date + memo not changed */
-        if(acctBaseEntries(bizKey, salesman, mode).some(e=>(!existing || e.id!==existing.id) && dupKey(e)===k)) return 'saved';
-        if(staged.some(s=>s.salesman===salesman && dupKey(s)===k)) return 'staged';
+        const hit = acctBaseEntries(bizKey, salesman, mode).find(e=>(!existing || e.id!==existing.id) && dupKey(e)===k);
+        if(hit) return {where:'saved', e:hit, sl:String(acctSlMap(bizKey, salesman, mode).get(hit.id) || '')};
+        const si = staged.findIndex(x=>x.salesman===salesman && dupKey(x)===k);
+        if(si>=0) return {where:'staged', e:staged[si], sl:'Staged #'+(si+1)};
         return null;
       }
-      function dupWhereText(w){ return w==='staged' ? 'in the Staged list below' : 'in this account'; }
+      function dupWhereText(w){ return w==='staged' ? 'in the Staged list below' : 'saved in this account'; }
+      /* Sl No - Date - Memo - Amount of the memo that already exists */
+      function dupDetailHtml(dd){
+        return `<table style="width:100%; border-collapse:collapse; margin-top:6px; font-size:12.5px; font-weight:500;"><thead><tr style="text-align:left; opacity:.8;"><th style="padding:2px 6px 2px 0;">Sl No</th><th style="padding:2px 6px;">Date</th><th style="padding:2px 6px;">Memo</th><th style="padding:2px 0 2px 6px; text-align:right;">Amount</th></tr></thead><tbody><tr><td class="mono" style="padding:2px 6px 2px 0;">${esc(dd.sl)}</td><td class="mono" style="padding:2px 6px;">${esc(dmy(dd.e.date))}</td><td class="mono" style="padding:2px 6px;">${esc(dd.e.memo)}</td><td class="mono" style="padding:2px 0 2px 6px; text-align:right;">${fmtMoney(dd.e.total)}</td></tr></tbody></table>`;
+      }
       function refreshDupNotice(){
         const box = document.getElementById('dupNotice'); if(!box) return;
         const date = document.getElementById('fDate').value, memo = document.getElementById('fMemo').value.trim();
         const sm = lockedSalesman || (document.getElementById('fSalesman')||{}).value;
-        const where = findDup(date, memo, sm);
-        box.style.display = where ? 'block' : 'none';
-        box.innerHTML = where ? `⚠ Duplicate memo — ${dmy(date)} · ${esc(memo)} is already ${dupWhereText(where)}. It will not be added.` : '';
+        const dd = findDup(date, memo, sm);
+        box.style.display = dd ? 'block' : 'none';
+        box.innerHTML = dd ? `⚠ Duplicate memo — the same date and memo number is already ${dupWhereText(dd.where)}. It will not be added.${dupDetailHtml(dd)}` : '';
       }
       ['fDate','fMemo','fSalesman'].forEach(id=>{
         const el = document.getElementById(id);
@@ -3126,10 +3164,10 @@ function openSalesEntryModal(bizKey, entryId, lockedSalesman, mode){
         const total = Number(document.getElementById('fTotal').value)||0;
         if(!date || !memo){ toast('Date and Memo Number are required','danger'); return null; }
         if(!salesman){ toast('Salesman account is required','danger'); return null; }
-        const dupWhere = findDup(date, memo, salesman);
-        if(dupWhere){
+        const dupFound = findDup(date, memo, salesman);
+        if(dupFound){
           refreshDupNotice();
-          toast(`Duplicate memo — ${dmy(date)} · ${memo} is already ${dupWhereText(dupWhere)}. Change the date or memo number.`, 'danger');
+          toast(`Duplicate memo — ${dmy(date)} · ${memo} (Sl ${dupFound.sl}, ${fmtMoney(dupFound.e.total)}) is already ${dupWhereText(dupFound.where)}. Change the date or memo number.`, 'danger');
           return null;
         }
         const cleanItems = localItems.filter(i=>i.modelNumber || i.productName).map(i=>({id:i.id, modelNumber:i.modelNumber, productName:i.productName, qty:Number(i.qty)||0}));
@@ -3267,12 +3305,10 @@ function openDuplicateSummary(bizKey, scopeSalesman, mode){
   const slMap = scopeSalesman ? acctSlMap(bizKey, scopeSalesman, mode) : null;
   function slFor(e){ return slMap ? (slMap.get(e.id)||'') : allBiz.findIndex(x=>x.id===e.id)+1; }
 
-  const rowsHtml = dups.length ? dups.map(e=>{
-    return `<div class="summary-row" data-goto="${e.id}">
-      <div class="sr-info"><span>#${slFor(e)}</span><span>${esc(e.date)}</span><span>Memo ${esc(e.memo)}</span>${scopeSalesman?'':`<span>${esc(e.salesman||'—')}</span>`}<span>${fmtMoney(e.total)}</span></div>
-      <button class="btn btn-sm btn-danger" data-del-dup="${e.id}" type="button">Delete</button>
-    </div>`;
-  }).join('') : `<div class="empty-state">No duplicate memos found${scopeSalesman?' for '+esc(scopeSalesman):' for this business'}${mode==='target'?' within the target period ('+esc(targetPeriodLabel(bizKey))+')':''}.</div>`;
+  const grpNo = new Map(); dups.forEach(e=>{ const k = dupKey(e); if(!grpNo.has(k)) grpNo.set(k, grpNo.size); });
+  const rowsHtml = dups.length ? `<div class="text-soft" style="font-size:12.5px; margin-bottom:6px;">${dups.length} memo(s) in ${grpNo.size} duplicate group(s) — click a row to find it in the table.</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Sl No</th><th>Date</th><th>Memo</th>${scopeSalesman?'':'<th>Salesman</th>'}<th class="right">Amount</th><th></th></tr></thead><tbody>${dups.map(e=>`<tr class="clickable-row" data-goto="${e.id}" style="${grpNo.get(dupKey(e))%2 ? 'background:var(--paper);' : ''}"><td class="mono">${slFor(e)}</td><td class="mono">${esc(dmy(e.date))}</td><td class="mono">${esc(e.memo)}</td>${scopeSalesman?'':`<td>${esc(e.salesman||'—')}</td>`}<td class="right mono">${fmtMoney(e.total)}</td><td class="right"><button class="btn btn-sm btn-danger" data-del-dup="${e.id}" type="button">Delete</button></td></tr>`).join('')}</tbody></table></div>`
+    : `<div class="empty-state">No duplicate memos found${scopeSalesman?' for '+esc(scopeSalesman):' for this business'}${mode==='target'?' within the target period ('+esc(targetPeriodLabel(bizKey))+')':''}.</div>`;
 
   openModal({
     title:'Duplicate Memo Summary — '+bizName(bizKey)+(scopeSalesman?' — '+scopeSalesman:'')+(mode==='target'?' (Target Period)':''), wide:true,
@@ -3306,8 +3342,8 @@ function openDuplicateSummary(bizKey, scopeSalesman, mode){
       });
       const copyBtn = document.getElementById('btnCopyDup');
       if(copyBtn) copyBtn.onclick = ()=>{
-        const tsv = 'SL\tDate\tMemo\tTotal Amount\n'+dups.map(e=>{
-          return `${slFor(e)}\t${e.date}\t${e.memo}\t${Number(e.total).toFixed(2)}`;
+        const tsv = 'Sl No\tDate\tMemo\tAmount\n'+dups.map(e=>{
+          return `${slFor(e)}\t${dmy(e.date)}\t${e.memo}\t${Number(e.total).toFixed(2)}`;
         }).join('\n');
         copyToClipboard(tsv);
       };
@@ -3905,7 +3941,7 @@ function openDataTransferModal(bizKey, pvs){
         if(mode==='move'){
           const ids = new Set(toMove.map(p=>p.id));
           saveProducts(bizKey, source.filter(p=>!ids.has(p.id)), {silent:true, noTrash:true});
-          auditAdd([{act:'transfer', biz:bizKey, txt:toMove.length+' product(s) moved to '+bizName(dest)}]);
+          auditAdd([{act:'transfer', biz:bizKey, txt:toMove.length+' product(s) moved to '+bizName(dest), det:{k:'product', lbl:toMove.length+' product(s) moved to '+bizName(dest), n:toMove.length, list:toMove.slice(0,100).map(snapProd)}}]);
         }
         pvs.selected.clear();
         toast(`${toMove.length} product(s) ${mode==='move'?'moved':'copied'} to ${bizName(dest)}`);
@@ -3972,7 +4008,7 @@ function openEntryTransferModal(bizKey, name, mode, selectedIds, filteredEntries
           updated = source.concat(copies);
         }
         saveSales(bizKey, updated, {noStock:true, silent:true});
-        auditAdd([{act:'transfer', biz:bizKey, txt:toMove.length+' memo(s) '+(xferMode==='move'?'moved':'copied')+' from '+name+' to '+dest}]);
+        auditAdd([{act:'transfer', biz:bizKey, txt:toMove.length+' memo(s) '+(xferMode==='move'?'moved':'copied')+' from '+name+' to '+dest, det:{k:'sale', lbl:toMove.length+' memo(s) '+(xferMode==='move'?'moved':'copied')+' from '+name+' to '+dest, n:toMove.length, list:toMove.slice(0,100).map(e=>snapSale(e,true))}}]);
         selectedIds.clear();
         toast(`${toMove.length} entry(ies) ${xferMode==='move'?'moved':'copied'} to ${esc(dest)}`);
         api.close();
@@ -5918,6 +5954,96 @@ function analyticsExcel(){
   }catch(e){ toast('Excel export failed: '+e.message, 'danger'); }
 }
 
+/* ---------- v4.9.0 detail views for the Audit Log and the Recycle Bin ---------- */
+const SIDE_LABEL = v => v==='target' ? 'Sales Target' : 'Promotional Sales';
+const PROD_LABELS = {productName:'Product Name', modelNumber:'Model No', price:'Price', quantity:'Stock', targetQuantity:'Target Qty', spQty:'Salesperson Promo Qty', ctQty:'Contractor Promo Qty', minStock:'Low-stock Level'};
+function fmtFull(ts){ try{ return new Date(ts).toLocaleString([], {weekday:'short', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'}); }catch(e){ return String(ts||''); } }
+function kvTableHtml(rows){
+  return `<div class="table-wrap"><table class="data-table"><tbody>${rows.map(r=>`<tr><td class="text-soft" style="width:36%; white-space:nowrap;">${esc(r[0])}</td><td>${r[1]}</td></tr>`).join('')}</tbody></table></div>`;
+}
+function saleRowsOf(x){ return [['Date', esc(dmy(x.date))], ['Memo No', esc(x.memo||'—')], ['Salesman', esc(x.salesman||'—')], ['Side', SIDE_LABEL(x.source)], ['Total Amount', fmtMoney(x.total)], ['Contractor', x.contractor ? esc(x.contractor) : '—']]; }
+function prodRowsOf(x){
+  const keys = Object.keys(PROD_LABELS).filter(k=>x[k]!==undefined).concat(Object.keys(x).filter(k=>!(k in PROD_LABELS)));
+  return keys.map(k=>[PROD_LABELS[k]||k, (k==='price' ? fmtMoney(x[k]) : esc(x[k]))]);
+}
+function itemRowsOf(items){ return (items||[]).map(i=>Array.isArray(i) ? i : [i.productName||'', i.modelNumber||'', Number(i.qty)||0]); }
+function itemsTableHtml(items){
+  const rows = itemRowsOf(items);
+  if(!rows.length) return '<div class="text-soft" style="font-size:12.5px;">No products on this memo.</div>';
+  const qty = rows.reduce((a,r)=>a+(Number(r[2])||0), 0);
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Sl No</th><th>Product</th><th>Model No</th><th class="right">Qty</th></tr></thead><tbody>${rows.map((r,i)=>`<tr><td class="mono">${i+1}</td><td>${esc(r[0])||'—'}</td><td class="mono">${esc(r[1])||'—'}</td><td class="right mono">${r[2]}</td></tr>`).join('')}<tr style="font-weight:600;"><td></td><td>Total quantity</td><td></td><td class="right mono">${qty}</td></tr></tbody></table></div>`;
+}
+function compareTableHtml(pairs){   /* pairs: [label, beforeHtml, afterHtml] */
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Field</th><th>Before</th><th>After</th></tr></thead><tbody>${pairs.map(p=>{
+    const ch = p[1]!==p[2];
+    return `<tr style="${ch ? 'background:rgba(245,166,35,.14);' : ''}"><td class="text-soft" style="white-space:nowrap;">${esc(p[0])}</td><td>${p[1]}</td><td>${p[2]}${ch ? ' <span class="pill pill-warn">changed</span>' : ''}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+function snapListHtml(kind, list, n){
+  if(!list || !list.length) return '';
+  const head = kind==='sale'
+    ? '<th>Sl No</th><th>Date</th><th>Memo</th><th>Salesman</th><th>Side</th><th class="right">Amount</th>'
+    : '<th>Sl No</th><th>Product</th><th>Model No</th><th class="right">Price</th><th class="right">Stock</th>';
+  const body = list.map((x,i)=> kind==='sale'
+    ? `<tr><td class="mono">${i+1}</td><td class="mono">${esc(dmy(x.date))}</td><td class="mono">${esc(x.memo)}</td><td>${esc(x.salesman||'—')}</td><td>${SIDE_LABEL(x.source)}</td><td class="right mono">${fmtMoney(x.total)}</td></tr>`
+    : `<tr><td class="mono">${i+1}</td><td>${esc(x.productName||'—')}</td><td class="mono">${esc(x.modelNumber||'—')}</td><td class="right mono">${fmtMoney(x.price)}</td><td class="right mono">${esc(x.quantity!==undefined?x.quantity:'—')}</td></tr>`).join('');
+  return `<div class="table-wrap"><table class="data-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${n>list.length ? `<div class="text-soft" style="font-size:12px;">…and ${n-list.length} more not listed here.</div>` : ''}`;
+}
+function openAuditDetail(r){
+  const det = r.det || null, kind = det && det.k, sale = kind==='sale';
+  let inner = '';
+  if(det){
+    if(det.lbl) inner += `<div class="det-h">Reason</div><div style="font-size:13px;">${esc(det.lbl)}</div>`;
+    if(r.act==='edit' && det.old && det.now){
+      const o = det.old, n = det.now;
+      if(sale){
+        const ro = saleRowsOf(o), rn = saleRowsOf(n);
+        inner += `<div class="det-h">What changed</div>` + compareTableHtml(ro.map((x,i)=>[x[0], x[1], rn[i][1]]));
+        const same = itemRowsOf(o.items).map(x=>x.join('~')).join('|')===itemRowsOf(n.items).map(x=>x.join('~')).join('|');
+        inner += same ? `<div class="det-h">Products (not changed)</div>${itemsTableHtml(n.items)}` : `<div class="det-h">Products — before</div>${itemsTableHtml(o.items)}<div class="det-h">Products — after</div>${itemsTableHtml(n.items)}`;
+      } else {
+        const keys = Array.from(new Set(Object.keys(o).concat(Object.keys(n))));
+        inner += `<div class="det-h">What changed</div>` + compareTableHtml(keys.map(k=>{ const f = v=>v===undefined ? '—' : (k==='price' ? fmtMoney(v) : esc(v)); return [PROD_LABELS[k]||k, f(o[k]), f(n[k])]; }));
+      }
+    } else if(det.list){
+      inner += `<div class="det-h">${det.n||det.list.length} ${sale?'memo(s)':'product(s)'}</div>` + snapListHtml(kind, det.list, det.n||det.list.length);
+    } else {
+      const x = det.now || det.old;
+      if(x) inner += `<div class="det-h">${r.act==='delete' ? 'Deleted ' : (r.act==='add' ? 'Added ' : '')}${sale?'memo':'product'}</div>` + kvTableHtml(sale ? saleRowsOf(x) : prodRowsOf(x)) + (sale ? `<div class="det-h">Products</div>${itemsTableHtml(x.items)}` : '');
+    }
+  } else {
+    inner = `<div class="text-soft" style="font-size:12.5px; margin-top:10px;">This record was written by an older version, so only the summary line above was saved. Everything you add, edit or delete from now on is saved here in full.</div>`;
+  }
+  openModal({
+    title:'Audit record — '+esc(r.act), wide:true,
+    bodyHtml: kvTableHtml([['When', esc(fmtFull(r.ts))], ['PC', esc(r.dev||'—')], ['Action', `<span class="pill ${ACT_PILL[r.act]||'pill-info'}">${esc(r.act)}</span>`], ['Business', esc(r.biz ? bizName(r.biz) : '—')], ['Summary', esc(r.txt)]]) + inner,
+    footerHtml:`<button class="btn btn-primary" data-cancel type="button">Close</button>`,
+    onMount(api){ api.overlay.querySelector('[data-cancel]').onclick = api.close; }
+  });
+}
+function openBinDetail(it, after){
+  const isSale = it.type==='sale', recs = it.recs.slice().sort((a,b)=> isSale ? (String(a.date||'').localeCompare(String(b.date||'')) || String(a.memo||'').localeCompare(String(b.memo||''), undefined, {numeric:true})) : 0);
+  const daysLeft = Math.max(0, TRASH_KEEP_DAYS - Math.floor((Date.now()-new Date(it.ts).getTime())/86400000));
+  let table;
+  if(isSale){
+    const total = recs.reduce((a,r)=>a+(Number(r.total)||0), 0);
+    table = `<div class="table-wrap"><table class="data-table"><thead><tr><th>Sl No</th><th>Date</th><th>Memo</th><th>Salesman</th><th>Side</th><th class="right">Amount</th><th>Products</th></tr></thead><tbody>${recs.map((r,i)=>`<tr><td class="mono">${i+1}</td><td class="mono">${esc(dmy(r.date))}</td><td class="mono">${esc(r.memo)}</td><td>${esc(r.salesman||'—')}</td><td>${SIDE_LABEL(r.source)}</td><td class="right mono">${fmtMoney(r.total)}</td><td style="font-size:12.5px;">${itemRowsOf(r.items).map(x=>`${esc(x[0]||x[1])}${x[1]&&x[0]?' ('+esc(x[1])+')':''} ×${x[2]}`).join('<br>')||'<span class="text-soft">—</span>'}</td></tr>`).join('')}<tr style="font-weight:600;"><td></td><td></td><td></td><td></td><td>Total</td><td class="right mono">${fmtMoney(total)}</td><td></td></tr></tbody></table></div>`;
+  } else {
+    const keys = Object.keys(PROD_LABELS);
+    table = `<div class="table-wrap"><table class="data-table"><thead><tr><th>Sl No</th>${keys.map(k=>`<th>${esc(PROD_LABELS[k])}</th>`).join('')}</tr></thead><tbody>${recs.map((r,i)=>`<tr><td class="mono">${i+1}</td>${keys.map(k=>`<td class="mono">${r[k]===undefined||r[k]==='' ? '—' : (k==='price' ? fmtMoney(r[k]) : esc(r[k]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  }
+  openModal({
+    title:'Recycle Bin item — '+it.recs.length+' '+(isSale?'memo':'product')+(it.recs.length===1?'':'s'), wide:true,
+    bodyHtml: kvTableHtml([['Deleted', esc(fmtFull(it.ts))], ['PC', esc(it.dev||'—')], ['Business', esc(bizName(it.biz))], ['Reason', it.label ? esc(it.label) : 'Deleted by hand'], ['Stock', isSale ? (it.stockRestored ? 'Added back when it was deleted' : 'Not changed') : '—'], ['Kept for', daysLeft+' more day(s), then removed for good']]) + `<div class="det-h">Everything in this item</div>` + table,
+    footerHtml:`<button class="btn btn-ghost" data-cancel type="button">Close</button><button class="btn btn-danger" id="btnBinDetDel" type="button">Delete forever</button><button class="btn btn-primary" id="btnBinDetRestore" type="button">Restore</button>`,
+    onMount(api){
+      api.overlay.querySelector('[data-cancel]').onclick = api.close;
+      document.getElementById('btnBinDetRestore').onclick = ()=>{ if(restoreTrashItem(it.id)){ api.close(); toast('Restored'); if(after) after(); } };
+      document.getElementById('btnBinDetDel').onclick = ()=>confirmDialog('Delete forever?', 'This cannot be undone.', ()=>{ deleteTrashItem(it.id); api.close(); toast('Deleted for good', 'danger'); if(after) after(); });
+    }
+  });
+}
+
 /* ---------- Recycle bin ---------- */
 function fmtWhen(ts){ try{ return new Date(ts).toLocaleString([], {day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'}); }catch(e){ return ts; } }
 function renderBin(){
@@ -5931,12 +6057,15 @@ function renderBin(){
       ${bin.length ? bin.map(it=>{
         const isSale = it.type==='sale', n = it.recs.length;
         const preview = it.recs.slice(0,4).map(r=>isSale ? `${esc(r.memo)} · ${esc(r.salesman)} · ${fmtMoney(r.total)}` : `${esc(r.productName)} · ${esc(r.modelNumber)}`).join('<br>');
-        return `<tr><td>${esc(fmtWhen(it.ts))}<div class="text-soft" style="font-size:11.5px;">${esc(it.dev||'')}</div></td><td>${esc(bizName(it.biz))}</td>
+        return `<tr class="clickable-row" data-bin-open="${it.id}"><td>${esc(fmtWhen(it.ts))}<div class="text-soft" style="font-size:11.5px;">${esc(it.dev||'')}</div></td><td>${esc(bizName(it.biz))}</td>
           <td><span class="pill ${isSale?'pill-info':'pill-warn'}">${n} ${isSale?'memo':'product'}${n===1?'':'s'}</span>${it.label?`<div class="text-soft" style="font-size:12px; margin-top:3px;">${esc(it.label)}</div>`:''}</td>
           <td style="font-size:12.5px;">${preview}${n>4?`<div class="text-soft">…and ${n-4} more</div>`:''}</td>
-          <td><button class="btn btn-sm btn-primary" data-bin-restore="${it.id}" type="button">Restore</button> <button class="btn btn-sm btn-danger" data-bin-del="${it.id}" type="button">Delete forever</button></td></tr>`;
+          <td><button class="btn btn-sm" data-bin-view="${it.id}" type="button">View</button> <button class="btn btn-sm btn-primary" data-bin-restore="${it.id}" type="button">Restore</button> <button class="btn btn-sm btn-danger" data-bin-del="${it.id}" type="button">Delete forever</button></td></tr>`;
       }).join('') : `<tr><td colspan="5">${emptyState('🗑️','Recycle Bin is empty','Anything you delete will show up here first.')}</td></tr>`}
     </tbody></table></div>`;
+  const openBin = id => { const it = bin.find(x=>x.id===id); if(it) openBinDetail(it, renderBin); };
+  view.querySelectorAll('[data-bin-open]').forEach(tr=>tr.addEventListener('click', ev=>{ if(ev.target.closest('button')) return; openBin(tr.dataset.binOpen); }));
+  view.querySelectorAll('[data-bin-view]').forEach(b=>b.onclick = ()=>openBin(b.dataset.binView));
   view.querySelectorAll('[data-bin-restore]').forEach(b=>b.onclick = ()=>{ if(restoreTrashItem(b.dataset.binRestore)){ toast('Restored'); renderBin(); } });
   view.querySelectorAll('[data-bin-del]').forEach(b=>b.onclick = ()=>confirmDialog('Delete forever?', 'This cannot be undone.', ()=>{ deleteTrashItem(b.dataset.binDel); toast('Deleted for good', 'danger'); renderBin(); }));
   const eb = document.getElementById('btnEmptyBin');
@@ -5968,9 +6097,9 @@ function renderAudit(){
       <span class="spacer"></span><span class="badge-count">${all.length} record(s)</span>
       <button class="btn" id="btnAuditExcel" type="button">⇩ Excel</button>
     </div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>PC</th><th>Action</th><th>Business</th><th>Details</th></tr></thead><tbody>
-      ${rows.length ? rows.map(r=>`<tr><td class="mono" style="white-space:nowrap;">${esc(fmtWhen(r.ts))}</td><td>${esc(r.dev||'')}</td><td><span class="pill ${ACT_PILL[r.act]||'pill-info'}">${esc(r.act)}</span></td><td>${esc(r.biz?bizName(r.biz):'')}</td><td style="font-size:12.5px;">${esc(r.txt)}</td></tr>`).join('')
-        : `<tr><td colspan="5">${emptyState('🕘','No activity recorded yet','Changes you make from now on will be listed here.')}</td></tr>`}
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>PC</th><th>Action</th><th>Business</th><th>Details</th><th></th></tr></thead><tbody>
+      ${rows.length ? rows.map(r=>`<tr class="clickable-row" data-aud="${esc(r.id)}"><td class="mono" style="white-space:nowrap;">${esc(fmtWhen(r.ts))}</td><td>${esc(r.dev||'')}</td><td><span class="pill ${ACT_PILL[r.act]||'pill-info'}">${esc(r.act)}</span></td><td>${esc(r.biz?bizName(r.biz):'')}</td><td style="font-size:12.5px;">${esc(r.txt)}</td><td><button class="btn btn-sm btn-ghost" type="button">View</button></td></tr>`).join('')
+        : `<tr><td colspan="6">${emptyState('🕘','No activity recorded yet','Changes you make from now on will be listed here.')}</td></tr>`}
     </tbody></table></div>
     ${all.length>rows.length ? `<div style="text-align:center; margin-top:12px;"><button class="btn btn-ghost" id="btnAuditMore" type="button">Show more (${all.length-rows.length} older)</button></div>` : ''}`;
   const rerenderKeepFocus = ()=>renderAudit();
@@ -5980,6 +6109,7 @@ function renderAudit(){
   qi.addEventListener('keydown', e=>{ if(e.key==='Enter'){ auState.q = qi.value; auState.limit = 300; renderAudit(); const q2 = document.getElementById('auQ'); q2.focus(); q2.setSelectionRange(q2.value.length, q2.value.length); } });
   qi.addEventListener('change', ()=>{ auState.q = qi.value; auState.limit = 300; renderAudit(); });
   const more = document.getElementById('btnAuditMore'); if(more) more.onclick = ()=>{ auState.limit += 300; renderAudit(); };
+  view.querySelectorAll('[data-aud]').forEach(tr=>tr.addEventListener('click', ()=>{ const rec = all.find(x=>x.id===tr.dataset.aud); if(rec) openAuditDetail(rec); }));
   document.getElementById('btnAuditExcel').onclick = ()=>excelFromRows('Audit Log', ['When','PC','Action','Business','Details'], all.map(r=>[fmtWhen(r.ts), r.dev||'', r.act, r.biz?bizName(r.biz):'', r.txt]), 'promaxis_audit_log');
 }
 
