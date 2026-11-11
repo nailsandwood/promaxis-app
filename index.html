@@ -669,7 +669,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.9.0";
+const APP_VERSION = "4.9.1";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -1392,6 +1392,36 @@ function saveSales(bizKey, list, opts){
   if(!opts.silent) auditDiff(bizKey, d, 'sale', opts);
 }
 function getProducts(bizKey){ return Store.get('products_'+bizKey, []); }
+/* v4.9.1 — the same product = same Product Name + same Model No. (spaces and capital letters ignored). */
+function prodKey(p){
+  const n = String(p.productName||'').trim().replace(/\s+/g,' ').toLowerCase(), m = String(p.modelNumber||'').trim().replace(/\s+/g,' ').toLowerCase();
+  return (n||m) ? n+'|'+m : '';
+}
+function productDupGroups(list){
+  const map = new Map();
+  list.forEach(p=>{ const k = prodKey(p); if(!k) return; if(!map.has(k)) map.set(k, []); map.get(k).push(p); });
+  return Array.from(map.values()).filter(g=>g.length>1);
+}
+/* Merge every group of the same product into ONE row. The FIRST row of a group is kept: sales, stock and promo
+   already look a product up by its first match, so it is the one the business has really been using. The other rows go to the
+   Recycle Bin. A blank price / target / promo on the kept row is filled from the rows removed. qtyMode: 'first' keeps the
+   first row's Qty (right when the copies came from a transfer), 'sum' adds the Qty of all rows. */
+function mergeDuplicateProducts(bizKey, qtyMode){
+  const list = getProducts(bizKey).map(p=>({...p}));
+  const groups = productDupGroups(list);
+  if(!groups.length) return 0;
+  const drop = new Set();
+  groups.forEach(g=>{
+    const keep = g[0];
+    if(qtyMode==='sum') keep.quantity = Math.round(g.reduce((a,p)=>a+(Number(p.quantity)||0), 0)*1000)/1000;
+    ['price','targetQuantity','spQty','ctQty','minStock'].forEach(f=>{
+      if(!(Number(keep[f])>0)){ const o = g.slice(1).find(p=>Number(p[f])>0); if(o) keep[f] = o[f]; }
+    });
+    g.slice(1).forEach(p=>drop.add(p.id));
+  });
+  saveProducts(bizKey, list.filter(p=>!drop.has(p.id)), {label:'Merged duplicate products'});
+  return drop.size;
+}
 function saveProducts(bizKey, list, opts){
   opts = opts || {};
   const key = 'products_'+bizKey;
@@ -3551,6 +3581,7 @@ function renderProductsView(bizKey){
   if(!bizKey || !BUSINESSES.find(b=>b.key===bizKey)){ location.hash = 'dashboard'; return; }
   setTitle('Promotional Sales & Target Product Details — '+bizName(bizKey));
   const pvs = getPVS(bizKey);
+  const dupGroupsNow = productDupGroups(getProducts(bizKey)), dupExtraNow = dupGroupsNow.reduce((a,g)=>a+g.length-1, 0);
 
   const view = document.getElementById('view');
   view.innerHTML = `
@@ -3563,6 +3594,7 @@ function renderProductsView(bizKey){
       <div class="search-box"><span class="ic">🔎</span><input id="searchInput" type="text" name="pmx_search" autocomplete="off" spellcheck="false" placeholder="Search product or model…" value="${esc(pvs.search)}"/></div>
       <button class="btn" id="btnFilter" type="button">▾ Filter</button>
       <button class="btn btn-accent" id="btnTransfer" type="button">⇄ Data Transfer</button>
+      <button class="btn ${dupExtraNow?'btn-primary':''}" id="btnMergeDup" type="button">🧩 Merge Duplicates${dupExtraNow ? ' ('+dupExtraNow+')' : ''}</button>
       <span class="spacer"></span>
       <button class="btn btn-danger" id="btnClear" type="button">Clear Data</button>
     </div>
@@ -3640,6 +3672,7 @@ function renderProductsView(bizKey){
   }
   function refreshTable(){
     const filtered = currentFiltered();
+    const dupCopyIds = new Set(); productDupGroups(getProducts(bizKey)).forEach(g=>g.slice(1).forEach(p=>dupCopyIds.add(p.id)));
     const tbody = document.getElementById('productsTbody');
     tbody.innerHTML = filtered.length===0
       ? `<tr><td colspan="11">${emptyState('📦', 'No products yet', `Click “+ Add Product” to build your product master for ${esc(bizName(bizKey))}.`)}</td></tr>`
@@ -3648,7 +3681,7 @@ function renderProductsView(bizKey){
           return `<tr data-id="${p.id}">
             <td><input type="checkbox" class="rowSel" data-id="${p.id}" ${pvs.selected.has(p.id)?'checked':''}/></td>
             <td class="mono">${idx+1}</td>
-            <td>${esc(p.productName)}</td>
+            <td>${esc(p.productName)}${dupCopyIds.has(p.id) ? ' <span class="pill pill-dup">Duplicate</span>' : ''}</td>
             <td class="mono">${esc(p.modelNumber)}</td>
             <td class="right mono">${fmtMoney(p.price)}</td>
             <td class="right mono">${p.quantity}</td>
@@ -3682,6 +3715,7 @@ function renderProductsView(bizKey){
     });
   };
   document.getElementById('btnTransfer').onclick = ()=>openDataTransferModal(bizKey, pvs);
+  document.getElementById('btnMergeDup').onclick = ()=>openMergeProductsModal(bizKey, ()=>renderProductsView(bizKey));
   document.getElementById('btnFilter').onclick = ()=>{ pvs.filterOpen=!pvs.filterOpen; document.getElementById('filterPanel').classList.toggle('open', pvs.filterOpen); };
   function readPVSFields(){
     pvs.fName = document.getElementById('fName').value;
@@ -3909,6 +3943,35 @@ function openProductModal(bizKey, productId){
   });
 }
 
+/* v4.9.1 — Merge Duplicate Products: shows every group of the same product, then merges them all in one click. */
+function openMergeProductsModal(bizKey, onDone){
+  const groups = productDupGroups(getProducts(bizKey)), extra = groups.reduce((a,g)=>a+g.length-1, 0);
+  if(!groups.length){
+    openModal({ title:'Merge Duplicate Products — '+esc(bizName(bizKey)), bodyHtml:`<div class="empty-state">No duplicate products found. (The same Product Name + Model No. counts as the same product.)</div>`,
+      footerHtml:`<button class="btn btn-primary" data-cancel type="button">Close</button>`, onMount(api){ api.overlay.querySelector('[data-cancel]').onclick = api.close; } });
+    return;
+  }
+  const rows = groups.map((g,gi)=>g.map((p,i)=>`<tr style="${gi%2 ? 'background:var(--paper);' : ''}"><td class="mono">${i===0 ? gi+1 : ''}</td><td>${i===0 ? esc(p.productName) : ''}</td><td class="mono">${i===0 ? esc(p.modelNumber) : ''}</td><td>${i===0 ? '<span class="pill pill-ok">Keep</span>' : '<span class="pill pill-dup">Remove</span>'}</td><td class="right mono">${fmtMoney(p.price)}</td><td class="right mono">${esc(p.quantity)}</td><td class="right mono">${esc(p.targetQuantity)}</td></tr>`).join('')).join('');
+  openModal({
+    title:'Merge Duplicate Products — '+esc(bizName(bizKey)), wide:true,
+    bodyHtml:`<p style="margin:0 0 10px; font-size:13px;"><b>${groups.length}</b> product(s) appear more than once — <b>${extra}</b> extra row(s) will be removed. Same Product Name + Model No. counts as the same product. The first row of each group is kept; the extra rows go to the Recycle Bin, so you can restore them.</p>
+      <div class="table-wrap" style="max-height:44vh; overflow:auto;"><table class="data-table"><thead><tr><th>#</th><th>Product</th><th>Model No.</th><th></th><th class="right">Price</th><th class="right">Qty</th><th class="right">Target Qty</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="field" style="margin-top:12px;"><label>Qty (stock) of the merged product</label>
+        <div class="checkbox-row"><input type="radio" name="qmode" value="first" id="qFirst" checked/><label for="qFirst" style="margin:0;">Keep the first row's Qty — right when the extra rows came from Data Transfer / Copy</label></div>
+        <div class="checkbox-row" style="margin-top:6px;"><input type="radio" name="qmode" value="sum" id="qSum"/><label for="qSum" style="margin:0;">Add the Qty of all rows together — right only if each row is separate stock</label></div></div>`,
+    footerHtml:`<button class="btn btn-ghost" data-cancel type="button">Cancel</button><button class="btn btn-primary" id="btnDoMerge" type="button">Merge ${extra} duplicate row(s)</button>`,
+    onMount(api){
+      api.overlay.querySelector('[data-cancel]').onclick = api.close;
+      document.getElementById('btnDoMerge').onclick = ()=>{
+        const n = mergeDuplicateProducts(bizKey, api.overlay.querySelector('input[name=qmode]:checked').value);
+        api.close();
+        undoToast(n+' duplicate product row(s) merged', _lastTrashId);
+        if(onDone) onDone();
+      };
+    }
+  });
+}
+
 function openDataTransferModal(bizKey, pvs){
   const others = BUSINESSES.filter(b=>b.key!==bizKey);
   const scopeCount = pvs.selected.size;
@@ -3936,15 +3999,29 @@ function openDataTransferModal(bizKey, pvs){
         const source = getProducts(bizKey);
         const toMove = scope==='selected' ? source.filter(p=>pvs.selected.has(p.id)) : source.slice();
         if(toMove.length===0){ toast('Nothing to transfer','danger'); return; }
-        const copies = toMove.map(p=>({...p, id:uid()}));
-        saveProducts(dest, getProducts(dest).concat(copies), {silent:true});
-        if(mode==='move'){
-          const ids = new Set(toMove.map(p=>p.id));
-          saveProducts(bizKey, source.filter(p=>!ids.has(p.id)), {silent:true, noTrash:true});
-          auditAdd([{act:'transfer', biz:bizKey, txt:toMove.length+' product(s) moved to '+bizName(dest), det:{k:'product', lbl:toMove.length+' product(s) moved to '+bizName(dest), n:toMove.length, list:toMove.slice(0,100).map(snapProd)}}]);
+        /* v4.9.1 — a product the destination already has (same Product Name + Model No.) is NOT added a second time */
+        const destList = getProducts(dest), have = new Set(destList.map(prodKey).filter(Boolean));
+        const copies = [], skippedIds = new Set();
+        toMove.forEach(p=>{
+          const k = prodKey(p);
+          if(k && have.has(k)){ skippedIds.add(p.id); return; }
+          if(k) have.add(k);
+          copies.push({...p, id:uid()});
+        });
+        if(copies.length) saveProducts(dest, destList.concat(copies), {silent:true});
+        const movedOnes = toMove.filter(p=>!skippedIds.has(p.id));
+        if(movedOnes.length){
+          const lbl = movedOnes.length+' product(s) '+(mode==='move'?'moved':'copied')+' to '+bizName(dest);
+          if(mode==='move'){
+            const ids = new Set(movedOnes.map(p=>p.id));
+            saveProducts(bizKey, source.filter(p=>!ids.has(p.id)), {silent:true, noTrash:true});
+          }
+          auditAdd([{act:'transfer', biz:bizKey, txt:lbl, det:{k:'product', lbl, n:movedOnes.length, list:movedOnes.slice(0,100).map(snapProd)}}]);
         }
         pvs.selected.clear();
-        toast(`${toMove.length} product(s) ${mode==='move'?'moved':'copied'} to ${bizName(dest)}`);
+        toast(movedOnes.length
+          ? `${movedOnes.length} product(s) ${mode==='move'?'moved':'copied'} to ${bizName(dest)}`+(skippedIds.size ? ` — ${skippedIds.size} already there, left as they are` : '')
+          : `Nothing added — all ${skippedIds.size} product(s) already exist in ${bizName(dest)}`, movedOnes.length ? 'success' : 'danger');
         api.close();
         renderProductsView(bizKey);
       }
