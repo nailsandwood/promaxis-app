@@ -1,4 +1,4 @@
-PROMAXIS v4.8.2
+PROMAXIS v4.9.1
 ================
 
 Files (upload ALL of them into the same folder, e.g. your GitHub Pages repo):
@@ -104,3 +104,24 @@ NEW IN 4.8.2 (duplicate memos, first built in 4.8.0)
                     in the Add to List (staged) entries; such a memo is not added. Add / Add to List / Save Changes all check it, and the final Add skips anything
                     that became a duplicate meanwhile.
                     Settings > Duplicate memos: switch the automatic deletion ON / OFF (ON by default).
+
+NEW IN 4.9.0
+  Filter on the salesman accounts page (Promotional Sales / Sales Target):
+                    the dates (and every other filter field) are now remembered. Close the software and open it again - the filter is still on, with the
+                    "Filtered" badge showing the dates. Press "Clear filter" or "Reset" to remove it. It is remembered per business and per side
+                    (Promotional Sales and Sales Target keep their own filter), on this device only.
+  Duplicate memos, more detail:
+                    Find Duplicate Memo now shows a table: Sl No - Date - Memo - Amount (duplicate groups shaded, click a row to jump to it, Delete per row).
+                    While adding memos, the red duplicate warning shows the memo that already exists as Sl No - Date - Memo - Amount, and says whether it is
+                    saved in the account or in the Add to List (staged) list. The Add to List table now has a Sl No column and shows the date as dd/mm/yyyy.
+  Audit Log:        click any record (or its View button) to open the full details: who/when/which PC, and the complete memo or product -
+                    date, memo no, salesman, side, amount, contractor and the product list. For an edit it shows Before / After with the changed fields marked.
+                    Records for Clear Account Data, transfers and restores list the memos involved. Records written by older versions only keep their summary line.
+  Recycle Bin:      click any item (or its View button) to see everything in it: deleted date and PC, reason (for example "Auto-deleted duplicate memo"),
+                    stock note, days left, and a table of every memo (Sl No, date, memo, salesman, side, amount, products) or product. Restore and
+                    Delete forever are also available inside the details window.
+
+
+FIX IN 4.9.1
+  Google sign-in: when the Google window closes early the message now says exactly what to check, and the Back Up page shows this page's own address
+                    (it must be listed under Authorized JavaScript origins). Google's sign-in script is loaded in advance so the pop-up opens straight from the click.
