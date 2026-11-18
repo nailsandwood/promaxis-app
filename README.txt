@@ -1,4 +1,4 @@
-PROMAXIS v4.9.1
+PROMAXIS v4.9.2
 ================
 
 Files (upload ALL of them into the same folder, e.g. your GitHub Pages repo):
@@ -125,3 +125,11 @@ NEW IN 4.9.0
 FIX IN 4.9.1
   Google sign-in: when the Google window closes early the message now says exactly what to check, and the Back Up page shows this page's own address
                     (it must be listed under Authorized JavaScript origins). Google's sign-in script is loaded in advance so the pop-up opens straight from the click.
+
+NEW IN 4.9.2  -  "Connect without pop-up" (Back Up page)
+  If the small Google window keeps closing (popup_closed), press "Connect without pop-up". The whole tab goes to Google, you choose the Gmail,
+  press Continue / Allow, and you come straight back to the Back Up page, connected. No pop-up is used.
+  Google Cloud: the page address (for example https://nailsandwood.github.io/promaxis-app/) must ALSO be under Authorized redirect URIs
+  (with the slash at the end, exactly as shown on the Back Up page). Authorized JavaScript origins stays as it is.
+  About once an hour Google asks again: the top badge turns amber, click it and you go to Google and come straight back (usually without any question).
+  "Connect & Sync" goes back to the pop-up method.

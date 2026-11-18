@@ -669,7 +669,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.9.1";
+const APP_VERSION = "4.9.2";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -5040,7 +5040,7 @@ const DRIVE_UP = 'https://www.googleapis.com/upload/drive/v3/files';
 const _sync = {state:'off', busy:false, dirty:false, seq:0, timer:null, applying:false, token:null, rerun:false, err:'', armed:false, remoteVersion:null, firstPending:0};
 
 function syncCfg(){
-  const c = Object.assign({clientId:'', hint:'', enabled:false, fileId:'', device:'', consented:false, last:null, backupFolderId:'', autoDrive:true, lastAuto:''}, Store.get('sync_cfg', {}));
+  const c = Object.assign({clientId:'', hint:'', enabled:false, fileId:'', device:'', consented:false, last:null, backupFolderId:'', autoDrive:true, lastAuto:'', redirectMode:false}, Store.get('sync_cfg', {}));
   if(!c.clientId) c.clientId = DEFAULT_CLIENT_ID;
   if(!c.hint) c.hint = DEFAULT_GMAIL;
   return c;
@@ -5081,12 +5081,56 @@ function loadGis(){
   });
   return _gisPromise;
 }
+/* ---- Sign in WITHOUT a pop-up: a full Google page that comes straight back to this page ----
+   Used when the small Google window keeps closing ("popup_closed"). Needs the page address under Authorized redirect URIs too. */
+const OAUTH_STATE_KEY = 'pmx_oauth_state', OAUTH_TOKEN_KEY = 'pmx_oauth_tok';
+let _redirectResult = null;
+function redirectUri(){ return location.origin + location.pathname.replace(/index\.html$/, ''); }
+(function captureGoogleReturn(){
+  try{
+    const raw = location.hash.slice(1);
+    if(raw.indexOf('state=')<0 || (raw.indexOf('access_token=')<0 && raw.indexOf('error=')<0)){
+      const t = JSON.parse(sessionStorage.getItem(OAUTH_TOKEN_KEY) || 'null');      /* same tab: pressing F5 does not ask Google again */
+      if(t && t.value && t.exp > Date.now()+60000) _sync.token = t;
+      return;
+    }
+    const p = new URLSearchParams(raw);
+    const want = localStorage.getItem(OAUTH_STATE_KEY);
+    if(!want || p.get('state')!==want) return;
+    localStorage.removeItem(OAUTH_STATE_KEY);
+    history.replaceState(null, '', location.pathname + location.search + '#backup');
+    if(p.get('access_token')){
+      if((p.get('scope')||'').indexOf('auth/drive.file')<0) _redirectResult = {error:'scope_missing'};
+      else _redirectResult = {token:p.get('access_token'), exp:Date.now()+(Number(p.get('expires_in'))||3600)*1000};
+    } else _redirectResult = {error:p.get('error')||'unknown'};
+  }catch(e){}
+})();
+function startRedirectSignIn(){
+  const cfg = syncCfg();
+  const a = new Uint8Array(16); crypto.getRandomValues(a);
+  const state = Array.from(a, b=>b.toString(16).padStart(2,'0')).join('');
+  try{ localStorage.setItem(OAUTH_STATE_KEY, state); }catch(e){ toast('This browser is blocking storage, so Google sign-in cannot continue.', 'danger'); return; }
+  const q = new URLSearchParams({client_id:cfg.clientId, redirect_uri:redirectUri(), response_type:'token', scope:'https://www.googleapis.com/auth/drive.file', state:state, include_granted_scopes:'true'});
+  if(cfg.hint) q.set('login_hint', cfg.hint);
+  toast('Opening Google sign-in…');
+  location.assign('https://accounts.google.com/o/oauth2/v2/auth?'+q.toString());
+}
+function googleRedirectErrorText(code){
+  const hint = syncCfg().hint || 'your Gmail';
+  if(code==='access_denied') return 'Google did not give access. Press "Connect without pop-up" again, choose '+hint+', then press Continue / Allow (tick the Drive box if it is shown). If Google says "Access blocked", add that Gmail under Test users.';
+  if(code==='scope_missing') return 'The Google Drive permission box was not ticked. Press "Connect without pop-up" again and tick the Drive permission before pressing Continue.';
+  return 'Google sign-in did not finish ('+code+'). Press "Connect without pop-up" and try again.';
+}
 /* mode: 'interactive' (user just clicked), 'gesture' (inside a click, may open the popup), 'silent' (background) */
 function gdToken(mode, force){
   return new Promise((resolve, reject)=>{
     if(!force && _sync.token && _sync.token.exp > Date.now()+60000) return resolve(_sync.token.value);
     const cfg = syncCfg();
     if(!cfg.clientId) return reject(Object.assign(new Error('Add your Google Client ID first'), {code:'noclient'}));
+    if(cfg.redirectMode){                                              /* this PC signs in on a full Google page, never in the small window */
+      if(mode==='interactive'){ startRedirectSignIn(); return; }       /* page leaves for Google and comes back */
+      return reject(Object.assign(new Error('Click the sync badge to reconnect'), {code:'auth'}));
+    }
     loadGis().then(()=>{
       let done = false;
       const client = google.accounts.oauth2.initTokenClient({
@@ -5188,7 +5232,7 @@ function googleFailHelp(e){
   if(/popup_failed_to_open/.test(t))
     return 'Google sign-in could not open its window: the browser blocked the pop-up. Click the pop-up icon at the right end of the address bar, choose "Always allow pop-ups from this site", then press Connect again.';
   if(/popup_closed|sign-in window closed/.test(t))
-    return 'The Google sign-in window closed before it finished. Press Connect again and read what that window says. If it says "origin_mismatch", add exactly  '+origin+'  under Authorized JavaScript origins (no slash at the end, no page name). If it says "Access blocked" or "access_denied", add '+hint+' under Test users on the OAuth consent screen. Otherwise choose the account and press Continue / Allow without closing the window.';
+    return 'The Google sign-in window closed before it finished. Press Connect again and read what that window says. If it says "origin_mismatch", add exactly  '+origin+'  under Authorized JavaScript origins (no slash at the end, no page name). If it says "Access blocked" or "access_denied", add '+hint+' under Test users on the OAuth consent screen. Otherwise choose the account and press Continue / Allow without closing the window. Still failing? Use the button "Connect without pop-up" on the Back Up page - it signs in on a full Google page instead of a small window.';
   return 'Google sign-in did not complete ('+t+'). This page address must be listed under Authorized JavaScript origins: '+origin+'  — and '+hint+' must be a Test user.';
 }
 async function syncNow(opts){
@@ -5313,7 +5357,16 @@ function startSyncEngine(){
   document.addEventListener('visibilitychange', wake);
   window.addEventListener('focus', wake);
   updateSyncBadge();
-  if(syncCfg().enabled){ if(location.protocol!=='file:') loadGis().catch(()=>{}); setTimeout(()=>syncNow({}), 300); armReauth(); }   /* armed so the very first click (e.g. the login button) can renew Google access */
+  if(_redirectResult){
+    const r = _redirectResult; _redirectResult = null;
+    if(r.token){
+      _sync.token = {value:r.token, exp:r.exp};
+      try{ sessionStorage.setItem(OAUTH_TOKEN_KEY, JSON.stringify(_sync.token)); }catch(e){}
+      setSyncCfg({consented:true, redirectMode:true});
+      toast('Google sign-in done - connecting…');
+      setTimeout(()=>syncNow({manual:true, force:true}), 600);
+    } else toast(googleRedirectErrorText(r.error), 'danger');
+  } else if(syncCfg().enabled){ if(location.protocol!=='file:' && !syncCfg().redirectMode) loadGis().catch(()=>{}); setTimeout(()=>syncNow({}), 300); armReauth(); }   /* armed so the very first click (e.g. the login button) can renew Google access */
   pollLoop();
   setTimeout(()=>maybeSnapshot(false), 4000);
 }
@@ -5330,9 +5383,10 @@ function syncCardsHtml(){
         <div class="field"><label>Google account (Gmail)</label><input type="email" id="syncHint" value="${esc(cfg.hint)}" placeholder="name@gmail.com" autocomplete="off"/></div>
         <div class="field"><label>This PC's name</label><input type="text" id="syncDevice" value="${esc(cfg.device)}" placeholder="e.g. Office PC"/></div>
       </div>
-      <div class="text-soft" style="font-size:12.5px; margin:-2px 0 10px;">This page's address: <b class="mono">${esc(location.origin)}</b> — Google Cloud → Credentials → your OAuth client → <i>Authorized JavaScript origins</i> must contain exactly this.</div>
+      <div class="text-soft" style="font-size:12.5px; margin:-2px 0 10px;">This page's address: <b class="mono">${esc(location.origin)}</b> — Google Cloud → Credentials → your OAuth client → <i>Authorized JavaScript origins</i> must contain exactly this. For <b>Connect without pop-up</b> the same address must also be under <i>Authorized redirect URIs</i>: <b class="mono">${esc(redirectUri())}</b></div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
         <button class="btn btn-primary" id="btnSyncConnect" type="button">${cfg.enabled ? 'Reconnect' : 'Connect &amp; Sync'}</button>
+        <button class="btn btn-ghost" id="btnSyncRedirect" type="button" title="Signs in on a full Google page instead of a small pop-up window">Connect without pop-up</button>
         <button class="btn btn-ghost" id="btnSyncNow" type="button" ${cfg.enabled?'':'disabled'}>Sync now</button>
         <button class="btn btn-ghost" id="btnSyncOff" type="button" ${cfg.enabled?'':'disabled'}>Disconnect</button>
         <span class="text-soft" id="syncDetail" style="font-size:12.5px;"></span>
@@ -5367,15 +5421,23 @@ function wireSyncCards(){
     if(location.protocol==='file:'){ toast('Google sign-in does not work when the app is opened from a folder. Open it from your https address (GitHub Pages) and connect there.', 'danger'); return; }
     const c = readCfg();
     if(!/\.apps\.googleusercontent\.com$/.test(c.clientId)){ toast('Paste the full Client ID (ends with .apps.googleusercontent.com)', 'danger'); return; }
-    setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2)});
-    _sync.token = null;
+    setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2), redirectMode:false});
+    _sync.token = null; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); }catch(e){}
     await syncNow({interactive:true, manual:true, force:true});
     renderBackup();
+  };
+  document.getElementById('btnSyncRedirect').onclick = ()=>{
+    if(location.protocol==='file:'){ toast('Google sign-in does not work when the app is opened from a folder. Open it from your https address (GitHub Pages) and connect there.', 'danger'); return; }
+    const c = readCfg();
+    if(!/\.apps\.googleusercontent\.com$/.test(c.clientId)){ toast('Paste the full Client ID (ends with .apps.googleusercontent.com)', 'danger'); return; }
+    setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2), redirectMode:true});
+    _sync.token = null; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); }catch(e){}
+    startRedirectSignIn();
   };
   document.getElementById('btnSyncNow').onclick = async ()=>{ await syncNow({interactive:true, manual:true}); renderBackup(); };
   document.getElementById('btnSyncOff').onclick = ()=>{
     confirmDialog('Disconnect cloud sync?', 'This PC stops syncing. Your data on this PC stays exactly as it is, and the copy in Google Drive is not deleted.', ()=>{
-      setSyncCfg({enabled:false, fileId:'', last:null}); Store.del('sync_base'); _sync.token = null; _sync.state = 'off';
+      setSyncCfg({enabled:false, fileId:'', last:null, redirectMode:false}); Store.del('sync_base'); _sync.token = null; _sync.state = 'off'; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); }catch(e){}
       updateSyncBadge(); renderBackup();
     });
   };
