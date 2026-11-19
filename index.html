@@ -669,7 +669,7 @@ td.sel-cell input, th.sel-cell input{width:19px; height:19px; cursor:pointer; ve
 (function(){
 "use strict";
 
-const APP_VERSION = "4.9.2";
+const APP_VERSION = "4.9.3";
 
 const BUSINESSES = [
   {key:"nails_wood",     name:"Nails & Wood"},
@@ -5041,6 +5041,7 @@ const _sync = {state:'off', busy:false, dirty:false, seq:0, timer:null, applying
 
 function syncCfg(){
   const c = Object.assign({clientId:'', hint:'', enabled:false, fileId:'', device:'', consented:false, last:null, backupFolderId:'', autoDrive:true, lastAuto:'', redirectMode:false}, Store.get('sync_cfg', {}));
+  c.redirectMode = true;                      /* v4.9.3: no pop-up mode exists any more */
   if(!c.clientId) c.clientId = DEFAULT_CLIENT_ID;
   if(!c.hint) c.hint = DEFAULT_GMAIL;
   return c;
@@ -5081,10 +5082,15 @@ function loadGis(){
   });
   return _gisPromise;
 }
-/* ---- Sign in WITHOUT a pop-up: a full Google page that comes straight back to this page ----
-   Used when the small Google window keeps closing ("popup_closed"). Needs the page address under Authorized redirect URIs too. */
-const OAUTH_STATE_KEY = 'pmx_oauth_state', OAUTH_TOKEN_KEY = 'pmx_oauth_tok';
+/* ---- Google sign-in: ALWAYS a full Google page that comes straight back. There is no pop-up anywhere in the app. ----
+   Google gives a web page a key that lasts 1 hour. The app renews it BY ITSELF before it runs out (see autoRenewCheck):
+   when nothing is open and nobody is typing, the page goes to Google with prompt=none and is back in about a second, on the same screen.
+   If Google really needs the person (signed out, consent withdrawn) the top badge turns amber and the green button signs in again. */
+const OAUTH_STATE_KEY = 'pmx_oauth_state', OAUTH_TOKEN_KEY = 'pmx_oauth_tok', OAUTH_RET_KEY = 'pmx_oauth_ret', OAUTH_SILENT_KEY = 'pmx_oauth_silent';
+const SILENT_TRY_KEY = 'pmx_silent_try', SILENT_BLOCK_KEY = 'pmx_silent_block', REDIRECT_OK_KEY = 'pmx_redirect_ok';
 let _redirectResult = null;
+let _lastActivity = Date.now(), _lastChangeAt = 0;
+['pointerdown','keydown','wheel','touchstart'].forEach(ev=>document.addEventListener(ev, ()=>{ _lastActivity = Date.now(); }, true));
 function redirectUri(){ return location.origin + location.pathname.replace(/index\.html$/, ''); }
 (function captureGoogleReturn(){
   try{
@@ -5097,57 +5103,70 @@ function redirectUri(){ return location.origin + location.pathname.replace(/inde
     const p = new URLSearchParams(raw);
     const want = localStorage.getItem(OAUTH_STATE_KEY);
     if(!want || p.get('state')!==want) return;
-    localStorage.removeItem(OAUTH_STATE_KEY);
-    history.replaceState(null, '', location.pathname + location.search + '#backup');
+    const silent = localStorage.getItem(OAUTH_SILENT_KEY)==='1';
+    const retRaw = localStorage.getItem(OAUTH_RET_KEY);
+    const ret = (retRaw===null) ? '#backup' : (retRaw==='' || (retRaw.charAt(0)==='#' && retRaw.length<300) ? retRaw : '#backup');
+    localStorage.removeItem(OAUTH_STATE_KEY); localStorage.removeItem(OAUTH_SILENT_KEY); localStorage.removeItem(OAUTH_RET_KEY);
+    history.replaceState(null, '', location.pathname + location.search + ret);       /* back to the screen the person was on */
     if(p.get('access_token')){
-      if((p.get('scope')||'').indexOf('auth/drive.file')<0) _redirectResult = {error:'scope_missing'};
-      else _redirectResult = {token:p.get('access_token'), exp:Date.now()+(Number(p.get('expires_in'))||3600)*1000};
-    } else _redirectResult = {error:p.get('error')||'unknown'};
+      if((p.get('scope')||'').indexOf('auth/drive.file')<0) _redirectResult = {error:'scope_missing', silent:silent};
+      else{
+        _redirectResult = {token:p.get('access_token'), exp:Date.now()+(Number(p.get('expires_in'))||3600)*1000, silent:silent};
+        try{ localStorage.setItem(REDIRECT_OK_KEY, '1'); localStorage.removeItem(SILENT_BLOCK_KEY); }catch(e){}
+      }
+    } else _redirectResult = {error:p.get('error')||'unknown', silent:silent};
+    if(silent && _redirectResult.error){ try{ localStorage.setItem(SILENT_BLOCK_KEY, String(Date.now()+6*3600*1000)); }catch(e){} }   /* Google needs the person: stop trying by itself */
   }catch(e){}
 })();
-function startRedirectSignIn(){
+function startRedirectSignIn(silent){
   const cfg = syncCfg();
   const a = new Uint8Array(16); crypto.getRandomValues(a);
   const state = Array.from(a, b=>b.toString(16).padStart(2,'0')).join('');
-  try{ localStorage.setItem(OAUTH_STATE_KEY, state); }catch(e){ toast('This browser is blocking storage, so Google sign-in cannot continue.', 'danger'); return; }
+  try{
+    localStorage.setItem(OAUTH_STATE_KEY, state);
+    localStorage.setItem(OAUTH_RET_KEY, location.hash || '');
+    localStorage.setItem(OAUTH_SILENT_KEY, silent ? '1' : '0');
+    if(silent) localStorage.setItem(SILENT_TRY_KEY, String(Date.now()));
+  }catch(e){ if(!silent) toast('This browser is blocking storage, so Google sign-in cannot continue.', 'danger'); return; }
   const q = new URLSearchParams({client_id:cfg.clientId, redirect_uri:redirectUri(), response_type:'token', scope:'https://www.googleapis.com/auth/drive.file', state:state, include_granted_scopes:'true'});
   if(cfg.hint) q.set('login_hint', cfg.hint);
-  toast('Opening Google sign-in…');
+  if(silent) q.set('prompt', 'none');                                   /* no question asked: Google either answers at once or says it needs the person */
+  else toast('Opening Google sign-in…');
   location.assign('https://accounts.google.com/o/oauth2/v2/auth?'+q.toString());
 }
 function googleRedirectErrorText(code){
   const hint = syncCfg().hint || 'your Gmail';
-  if(code==='access_denied') return 'Google did not give access. Press "Connect without pop-up" again, choose '+hint+', then press Continue / Allow (tick the Drive box if it is shown). If Google says "Access blocked", add that Gmail under Test users.';
-  if(code==='scope_missing') return 'The Google Drive permission box was not ticked. Press "Connect without pop-up" again and tick the Drive permission before pressing Continue.';
-  return 'Google sign-in did not finish ('+code+'). Press "Connect without pop-up" and try again.';
+  if(code==='access_denied') return 'Google did not give access. Press the green button again, choose '+hint+', then press Continue / Allow (tick the Drive box if it is shown). If Google says "Access blocked", add that Gmail under Test users.';
+  if(code==='scope_missing') return 'The Google Drive permission box was not ticked. Press the green button again and tick the Drive permission before pressing Continue.';
+  return 'Google sign-in did not finish ('+code+'). Press the green button and try again. If Google showed "redirect_uri_mismatch", add exactly  '+redirectUri()+'  under Authorized redirect URIs.';
 }
-/* mode: 'interactive' (user just clicked), 'gesture' (inside a click, may open the popup), 'silent' (background) */
+/* Renews the Google key by itself, only at a SAFE moment: signed in to the app, no window open, nobody typing or clicking for a few seconds,
+   no change saved in the last few seconds, no sync running. A bad answer from Google stops it for 6 hours (no loops); any good sign-in clears that. */
+function autoRenewCheck(){
+  try{
+    const cfg = syncCfg();
+    if(!cfg.enabled || !cfg.clientId || !navigator.onLine || !/^https?:$/.test(location.protocol)) return;
+    if(tokenAlive(10*60000)) return;                                    /* plenty of time left */
+    if(localStorage.getItem(REDIRECT_OK_KEY)!=='1') return;            /* only after a normal sign-in has worked once on this browser */
+    const now = Date.now();
+    if(Number(localStorage.getItem(SILENT_BLOCK_KEY)||0) > now) return;
+    if(now - Number(localStorage.getItem(SILENT_TRY_KEY)||0) < 3*60000) return;
+    if(!isUnlocked()) return;
+    if(_sync.busy || _sync.applying) return;
+    if(now - _lastActivity < 8000 || now - _lastChangeAt < 8000) return;
+    if(viewIsBusy()) return;                                            /* a window is open or a box is being typed in */
+    if(_sync.dirty && tokenAlive(0)) return;                            /* let the waiting change reach Drive first */
+    startRedirectSignIn(true);
+  }catch(e){}
+}
+/* mode: 'interactive' (the person just pressed a button) or anything else (background: never opens anything) */
 function gdToken(mode, force){
   return new Promise((resolve, reject)=>{
     if(!force && _sync.token && _sync.token.exp > Date.now()+60000) return resolve(_sync.token.value);
     const cfg = syncCfg();
     if(!cfg.clientId) return reject(Object.assign(new Error('Add your Google Client ID first'), {code:'noclient'}));
-    if(cfg.redirectMode){                                              /* this PC signs in on a full Google page, never in the small window */
-      if(mode==='interactive'){ startRedirectSignIn(); return; }       /* page leaves for Google and comes back */
-      return reject(Object.assign(new Error('Click the sync badge to reconnect'), {code:'auth'}));
-    }
-    loadGis().then(()=>{
-      let done = false;
-      const client = google.accounts.oauth2.initTokenClient({
-        client_id: cfg.clientId,
-        scope: 'https://www.googleapis.com/auth/drive.file',
-        hint: cfg.hint || undefined,
-        callback: r=>{
-          if(done) return; done = true;
-          if(r.error) return reject(Object.assign(new Error(r.error_description || r.error), {code:'auth'}));
-          _sync.token = {value:r.access_token, exp:Date.now()+(Number(r.expires_in)||3600)*1000};
-          if(!cfg.consented) setSyncCfg({consented:true});
-          resolve(r.access_token);
-        },
-        error_callback: e=>{ if(done) return; done = true; reject(Object.assign(new Error((e && e.type) || 'sign-in window closed'), {code:'popup'})); }
-      });
-      client.requestAccessToken({prompt: mode==='interactive' ? (cfg.consented ? '' : 'consent') : (mode==='silent' ? 'none' : '')});
-    }).catch(e=>reject(e.code ? e : Object.assign(e, {code:'load'})));
+    if(mode==='interactive'){ startRedirectSignIn(false); return; }    /* page leaves for Google and comes straight back */
+    return reject(Object.assign(new Error('Click the sync badge to reconnect'), {code:'auth'}));
   });
 }
 /* ---- gzip helpers: the sync file is compressed (roughly 8x smaller), which is what makes a sync take ~1 second ---- */
@@ -5196,19 +5215,8 @@ function applyMergedState(local, merged){
   return changed;
 }
 const tokenAlive = (minMs)=>!!(_sync.token && _sync.token.exp > Date.now()+(minMs||0));
-/* Google only hands out 1-hour tokens to a web page. A click/keypress is needed to renew one (browsers block pop-ups otherwise),
-   so the next click after the token gets old renews it quietly and syncing carries on. */
-function armReauth(){
-  if(_sync.armed) return;
-  _sync.armed = true;
-  const h = ()=>{
-    document.removeEventListener('pointerdown', h, true); document.removeEventListener('keydown', h, true);
-    _sync.armed = false;
-    gdToken('gesture', true).then(()=>{ _sync.state = 'ok'; _sync.err = ''; updateSyncBadge(); syncNow({}); })
-      .catch(e=>{ if(!tokenAlive(0)){ _sync.state = 'reconnect'; _sync.err = e.message; updateSyncBadge(); armReauth(); } });
-  };
-  document.addEventListener('pointerdown', h, true); document.addEventListener('keydown', h, true);
-}
+/* (v4.9.3) The pop-up era needed a click to renew Google access; now autoRenewCheck() does it by itself. */
+function armReauth(){ /* v4.9.3: nothing to arm - the app renews Google access by itself (autoRenewCheck) */ }
 let _pendingRefresh = false, _lastPullToast = 0;
 function viewIsBusy(){
   if(document.getElementById('modalRoot').children.length>0) return 'modal';
@@ -5329,7 +5337,7 @@ async function pollOnce(){
 }
 function pollLoop(){
   clearTimeout(_pollTimer);
-  _pollTimer = setTimeout(async ()=>{ try{ await pollOnce(); }catch(e){} pollLoop(); }, document.hidden ? 15000 : 2000);
+  _pollTimer = setTimeout(async ()=>{ try{ autoRenewCheck(); }catch(e){} try{ await pollOnce(); }catch(e){} pollLoop(); }, document.hidden ? 15000 : 2000);
 }
 
 let _snapTimer = null;
@@ -5345,6 +5353,7 @@ function maybeSnapshot(force){
 }
 function startSyncEngine(){
   Store.onChange = function(key){
+    _lastChangeAt = Date.now();
     if(_sync.applying || isLocalOnlyKey(key)) return;
     _sync.seq++; _sync.dirty = true;
     updateSyncBadge(); scheduleSync(); scheduleSnapshot();
@@ -5363,10 +5372,13 @@ function startSyncEngine(){
       _sync.token = {value:r.token, exp:r.exp};
       try{ sessionStorage.setItem(OAUTH_TOKEN_KEY, JSON.stringify(_sync.token)); }catch(e){}
       setSyncCfg({consented:true, redirectMode:true});
-      toast('Google sign-in done - connecting…');
-      setTimeout(()=>syncNow({manual:true, force:true}), 600);
+      if(r.silent){ _sync.state = 'ok'; _sync.err = ''; updateSyncBadge(); setTimeout(()=>syncNow({}), 300); }          /* renewed quietly */
+      else{ toast('Google sign-in done - connecting…'); setTimeout(()=>syncNow({manual:true, force:true}), 600); }
+    } else if(r.silent){
+      _sync.state = 'reconnect'; _sync.err = 'Google needs you to sign in again'; updateSyncBadge();                  /* amber badge, no red message */
+      setTimeout(()=>syncNow({}), 300);
     } else toast(googleRedirectErrorText(r.error), 'danger');
-  } else if(syncCfg().enabled){ if(location.protocol!=='file:' && !syncCfg().redirectMode) loadGis().catch(()=>{}); setTimeout(()=>syncNow({}), 300); armReauth(); }   /* armed so the very first click (e.g. the login button) can renew Google access */
+  } else if(syncCfg().enabled){ setTimeout(()=>syncNow({}), 300); }
   pollLoop();
   setTimeout(()=>maybeSnapshot(false), 4000);
 }
@@ -5383,10 +5395,9 @@ function syncCardsHtml(){
         <div class="field"><label>Google account (Gmail)</label><input type="email" id="syncHint" value="${esc(cfg.hint)}" placeholder="name@gmail.com" autocomplete="off"/></div>
         <div class="field"><label>This PC's name</label><input type="text" id="syncDevice" value="${esc(cfg.device)}" placeholder="e.g. Office PC"/></div>
       </div>
-      <div class="text-soft" style="font-size:12.5px; margin:-2px 0 10px;">This page's address: <b class="mono">${esc(location.origin)}</b> — Google Cloud → Credentials → your OAuth client → <i>Authorized JavaScript origins</i> must contain exactly this. For <b>Connect without pop-up</b> the same address must also be under <i>Authorized redirect URIs</i>: <b class="mono">${esc(redirectUri())}</b></div>
+      <div class="text-soft" style="font-size:12.5px; margin:-2px 0 10px;">This page's address: <b class="mono">${esc(location.origin)}</b> — Google Cloud → Credentials → your OAuth client → <i>Authorized JavaScript origins</i> must contain exactly this. Also add this exact page address under <i>Authorized redirect URIs</i>: <b class="mono">${esc(redirectUri())}</b></div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <button class="btn btn-primary" id="btnSyncConnect" type="button">${cfg.enabled ? 'Reconnect' : 'Connect &amp; Sync'}</button>
-        <button class="btn btn-ghost" id="btnSyncRedirect" type="button" title="Signs in on a full Google page instead of a small pop-up window">Connect without pop-up</button>
+        <button class="btn btn-primary" id="btnSyncConnect" type="button" title="Goes to Google and comes straight back - no pop-up window">${cfg.enabled ? 'Reconnect' : 'Connect &amp; Sync'}</button>
         <button class="btn btn-ghost" id="btnSyncNow" type="button" ${cfg.enabled?'':'disabled'}>Sync now</button>
         <button class="btn btn-ghost" id="btnSyncOff" type="button" ${cfg.enabled?'':'disabled'}>Disconnect</button>
         <span class="text-soft" id="syncDetail" style="font-size:12.5px;"></span>
@@ -5395,10 +5406,10 @@ function syncCardsHtml(){
         <ol class="text-soft" style="font-size:12.5px; line-height:1.7; padding-left:18px;">
           <li>Open <b>console.cloud.google.com</b> → create a project → <b>APIs &amp; Services → Library</b> → enable <b>Google Drive API</b>.</li>
           <li><b>OAuth consent screen</b> → External → add your own Google account under <b>Test users</b>.</li>
-          <li><b>Credentials → Create credentials → OAuth client ID → Web application</b>. Under <i>Authorized JavaScript origins</i> add this address: <span class="mono">${esc(location.origin==='null'?'(open the app from its https address)':location.origin)}</span></li>
-          <li>Copy the Client ID, paste it above, press <b>Connect &amp; Sync</b>, sign in. While the app is in Testing mode Google shows “hasn't verified this app” — press <b>Advanced → Go to … (unsafe)</b>, then tick the Drive permission.</li>
+          <li><b>Credentials → Create credentials → OAuth client ID → Web application</b>. Under <i>Authorized redirect URIs</i> add the page address shown above; under <i>Authorized JavaScript origins</i> add this address: <span class="mono">${esc(location.origin==='null'?'(open the app from its https address)':location.origin)}</span></li>
+          <li>Copy the Client ID, paste it above, press <b>Connect &amp; Sync</b>, sign in on the Google page. While the app is in Testing mode Google shows “hasn't verified this app” — press <b>Advanced → Go to … (unsafe)</b>, then tick the Drive permission.</li>
         </ol>
-        <p class="text-soft" style="font-size:12px;">Google asks you to sign in again about once an hour; the badge at the top turns amber — just click anywhere and it reconnects. The sync file is called <span class="mono">${SYNC_FILE}</span> in your Drive.</p>
+        <p class="text-soft" style="font-size:12px;">Google gives the app a key that lasts 1 hour. The app renews it by itself (a one-second trip to Google and back) when nothing is open and nobody is typing. If Google needs you, the badge at the top turns amber — press the green button. The sync file is called <span class="mono">${SYNC_FILE}</span> in your Drive.</p>
       </details>
     </div>
     <div class="card" style="margin-top:16px;">
@@ -5414,25 +5425,15 @@ function syncCardsHtml(){
 function wireSyncCards(){
   const v = document.getElementById('view');
   updateSyncBadge();
-  if(location.protocol!=='file:') loadGis().catch(()=>{});   /* ready before the click, so the pop-up opens instantly */
   const readCfg = ()=>({clientId:document.getElementById('syncClientId').value.trim(), hint:document.getElementById('syncHint').value.trim(), device:document.getElementById('syncDevice').value.trim()});
   document.getElementById('syncDevice').onchange = ()=>setSyncCfg({device:readCfg().device});
-  document.getElementById('btnSyncConnect').onclick = async ()=>{
-    if(location.protocol==='file:'){ toast('Google sign-in does not work when the app is opened from a folder. Open it from your https address (GitHub Pages) and connect there.', 'danger'); return; }
-    const c = readCfg();
-    if(!/\.apps\.googleusercontent\.com$/.test(c.clientId)){ toast('Paste the full Client ID (ends with .apps.googleusercontent.com)', 'danger'); return; }
-    setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2), redirectMode:false});
-    _sync.token = null; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); }catch(e){}
-    await syncNow({interactive:true, manual:true, force:true});
-    renderBackup();
-  };
-  document.getElementById('btnSyncRedirect').onclick = ()=>{
+  document.getElementById('btnSyncConnect').onclick = ()=>{
     if(location.protocol==='file:'){ toast('Google sign-in does not work when the app is opened from a folder. Open it from your https address (GitHub Pages) and connect there.', 'danger'); return; }
     const c = readCfg();
     if(!/\.apps\.googleusercontent\.com$/.test(c.clientId)){ toast('Paste the full Client ID (ends with .apps.googleusercontent.com)', 'danger'); return; }
     setSyncCfg({clientId:c.clientId, hint:c.hint, device:c.device || 'PC-'+randHex(2), redirectMode:true});
-    _sync.token = null; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); }catch(e){}
-    startRedirectSignIn();
+    _sync.token = null; try{ sessionStorage.removeItem(OAUTH_TOKEN_KEY); localStorage.removeItem(SILENT_BLOCK_KEY); }catch(e){}
+    startRedirectSignIn(false);
   };
   document.getElementById('btnSyncNow').onclick = async ()=>{ await syncNow({interactive:true, manual:true}); renderBackup(); };
   document.getElementById('btnSyncOff').onclick = ()=>{

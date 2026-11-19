@@ -1,4 +1,4 @@
-PROMAXIS v4.9.2
+PROMAXIS v4.9.3
 ================
 
 Files (upload ALL of them into the same folder, e.g. your GitHub Pages repo):
@@ -16,7 +16,7 @@ FIRST OPEN
   2. Old password/recovery key that were visible in the source code are retired.
 
 GOOGLE DRIVE SYNC (multi-PC)  -  Back Up page
-  The Client ID and Gmail are already filled in. Just open the app from its https address, go to Back Up and press Connect & Sync.
+  The Client ID and Gmail are already filled in. Just open the app from its https address, go to Back Up and press the green Connect & Sync / Reconnect button.
   Before that, in Google Cloud (project promaxis-510712) make sure: Google Drive API is enabled, the Gmail is a Test user, and your site address is under Authorized JavaScript origins.
   (Only needed if you ever create a new Client ID:)
   1. console.cloud.google.com -> new project -> enable "Google Drive API"
@@ -24,7 +24,7 @@ GOOGLE DRIVE SYNC (multi-PC)  -  Back Up page
   3. Credentials -> OAuth client ID -> Web application -> Authorized JavaScript origins = the address where the app lives (e.g. https://yourname.github.io)
   4. Paste the Client ID on the Back Up page, press Connect & Sync.
   Connect your main PC first. On other PCs connect BEFORE entering new data.
-  Google asks to sign in again about once an hour; the top-bar badge turns amber, click anywhere and it reconnects.
+  Google gives the app a key that lasts 1 hour; since 4.9.3 the app renews it by itself (see NEW IN 4.9.3).
 
 SETTINGS TO CHECK
   Settings -> Incentive slabs : sample rates (80% -> 0.5%, 100% -> 1%, 120% -> 1.5%) are placeholders. Enter your real rates, then switch it ON.
@@ -133,3 +133,18 @@ NEW IN 4.9.2  -  "Connect without pop-up" (Back Up page)
   (with the slash at the end, exactly as shown on the Back Up page). Authorized JavaScript origins stays as it is.
   About once an hour Google asks again: the top badge turns amber, click it and you go to Google and come straight back (usually without any question).
   "Connect & Sync" goes back to the pop-up method.
+
+
+NEW IN 4.9.3  -  automatic reconnect, one button, no pop-up anywhere
+  One button      : the Back Up page now has ONE main green button (Connect & Sync, or Reconnect once connected). It always goes to a full Google page and
+                    comes straight back. "Connect without pop-up" and the old pop-up are gone; the Google pop-up script is not even loaded any more.
+  Auto reconnect  : Google only gives a web page a key that lasts 1 hour. Before it runs out the app renews it BY ITSELF. It does this only at a safe moment:
+                    you are signed in to the app, no window (memo form, dialog) is open, nobody has typed or clicked for 8 seconds, nothing was saved in the
+                    last 8 seconds, and no sync is running. The page goes to Google and is back in about a second, on the SAME screen you were on.
+                    You are not asked for the PROMAXIS password again (the tab stays unlocked). Your data is not touched - it is saved on this PC before and after.
+  If Google needs you : (signed out of Google, or access withdrawn) the top badge turns amber "Click to reconnect". Press the green button once.
+                    After a refusal like that the app does NOT keep trying by itself for 6 hours (so it can never loop); a good sign-in clears that at once.
+  First time      : the automatic renewal switches on after ONE normal sign-in with the green button on this browser (it needs to know the redirect works).
+  Google Cloud    : nothing new to set. The redirect address (https://nailsandwood.github.io/promaxis-app/ , slash at the end) must be under
+                    Authorized redirect URIs, as in 4.9.2.
+  Data safety     : nothing in how memos, products, accounts, stock, backups, snapshots or the Drive merge work was changed - only the Google sign-in part.
